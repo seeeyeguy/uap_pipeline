@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────
+# UAP Pipeline — Requirements
+# ─────────────────────────────────────────────
+# BEFORE running pip install, do this once:
+#
+#   git clone https://github.com/huggingface/transformers.git /apps/transformers
+#   pip install -e /apps/transformers
+#
+# To update transformers later:
+#   cd /apps/transformers && git pull
+# ─────────────────────────────────────────────
+
+# PyTorch — install manually FIRST to match your CUDA version:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# torch
+# torchvision
+
+# OCR / PDF / image handling
+pdf2image>=1.17.0
+Pillow>=10.0.0
+
+# HTTP + progress
+requests>=2.31.0
+tqdm>=4.66.0
+
+# LLM enrichment
+anthropic>=0.28.0
+
+# Chunking
+langchain>=0.2.0
+langchain-text-splitters>=0.2.0
+
+# Embeddings
+sentence-transformers>=3.0.0
+
+# Vector DB
+chromadb>=0.5.0
+
+# ─────────────────────────────────────────────
+# SYSTEM DEPENDENCY (not pip):
+# pdf2image requires poppler
+#
+#   Ubuntu/Debian:  sudo apt install poppler-utils
+#
+# Set your API key before running:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+# ─────────────────────────────────────────────
+
+accelerate>=0.30.0
