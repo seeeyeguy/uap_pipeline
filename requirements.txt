@@ -23,6 +23,12 @@ Pillow>=10.0.0
 requests>=2.31.0
 tqdm>=4.66.0
 
+# Source discovery scrapers (pipeline.py discover)
+beautifulsoup4>=4.12.0
+
+# PDF text-layer fast path (skips GPU OCR for born-digital PDFs)
+pypdf>=4.0.0
+
 # LLM enrichment
 anthropic>=0.28.0
 
