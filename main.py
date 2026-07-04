@@ -50,6 +50,15 @@ CHUNK_SIZE     = 512
 CHUNK_OVERLAP  = 64
 MAX_NEW_TOKENS = 8192
 
+# PDFs whose embedded text layer averages at least this many characters
+# per page skip GPU OCR entirely (most modern government releases are
+# born-digital or already OCRed).
+TEXT_LAYER_MIN_CHARS_PER_PAGE = 200
+
+# Text-native formats ingested without OCR
+TEXT_NATIVE_EXTS = {".txt", ".md", ".csv", ".json", ".jsonl", ".html", ".htm"}
+CSV_ROWS_PER_DOC = 100   # structured rows grouped per pseudo-document
+
 # Set your Anthropic API key in your environment:
 #   export ANTHROPIC_API_KEY=sk-ant-...
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -109,6 +118,42 @@ def load_llm_client():
     if not ANTHROPIC_API_KEY:
         raise EnvironmentError("ANTHROPIC_API_KEY not set. Export it before running.")
     return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+class Models:
+    """
+    Lazy loader so a run that never needs a component never pays for it —
+    e.g. a corpus of born-digital PDFs and CSVs loads no OCR model at all.
+    """
+    def __init__(self):
+        self._ocr = None
+        self._embedder = None
+        self._collection = None
+        self._llm = None
+
+    @property
+    def ocr(self):
+        if self._ocr is None:
+            self._ocr = load_ocr_model()
+        return self._ocr
+
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            self._embedder = load_embed_model()
+        return self._embedder
+
+    @property
+    def collection(self):
+        if self._collection is None:
+            self._collection = load_vectordb()
+        return self._collection
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = load_llm_client()
+        return self._llm
 
 
 # ─────────────────────────────────────────────
@@ -247,6 +292,26 @@ def ocr_image(image_path: Path, processor, model) -> str:
     ).strip()
 
 
+def extract_pdf_text_layer(pdf_path: Path) -> Optional[str]:
+    """
+    Pull the embedded text layer from a PDF. Returns None when the PDF is
+    image-only (or too sparse), signalling that OCR is required.
+    """
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(pdf_path))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+        if not pages:
+            return None
+        avg_chars = sum(len(p) for p in pages) / len(pages)
+        if avg_chars < TEXT_LAYER_MIN_CHARS_PER_PAGE:
+            return None
+        return "\n\n".join(f"--- Page {i+1} ---\n{p}" for i, p in enumerate(pages))
+    except Exception as e:
+        log.warning(f"Text-layer extraction failed for {pdf_path.name}: {e}")
+        return None
+
+
 def ocr_pdf(pdf_path: Path, processor, model) -> str:
     img_dir = Path(DIRS["images"]) / pdf_path.stem
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +387,7 @@ def deduplicate_texts(docs: list[dict], threshold: float = 0.85) -> list[dict]:
     return kept
 
 
-def process_files(files: dict, processor, model) -> list[dict]:
+def process_files(files: dict, models: "Models", force_ocr: bool = False) -> list[dict]:
     results = []
     for pdf in files["pdfs"]:
         txt_path = Path(DIRS["text"]) / (pdf.stem + ".txt")
@@ -330,7 +395,11 @@ def process_files(files: dict, processor, model) -> list[dict]:
             log.info(f"Skipping OCR (cached): {pdf.name}")
             text = txt_path.read_text(encoding="utf-8")
         else:
-            text = ocr_pdf(pdf, processor, model)
+            text = None if force_ocr else extract_pdf_text_layer(pdf)
+            if text:
+                log.info(f"Text layer found, skipping OCR: {pdf.name}")
+            else:
+                text = ocr_pdf(pdf, *models.ocr)
             save_text(text, pdf)
         results.append({"source": str(pdf), "filename": pdf.name, "text": text})
 
@@ -340,11 +409,89 @@ def process_files(files: dict, processor, model) -> list[dict]:
             log.info(f"Skipping OCR (cached): {img.name}")
             text = txt_path.read_text(encoding="utf-8")
         else:
-            text = ocr_image(img, processor, model)
+            text = ocr_image(img, *models.ocr)
             save_text(text, img)
         results.append({"source": str(img), "filename": img.name, "text": text})
 
     return results
+
+
+def read_text_native(path: Path) -> list[dict]:
+    """
+    Ingest text-native files without OCR.
+
+    - .txt/.md          -> one document
+    - .html/.htm        -> tag-stripped text, one document
+    - .csv              -> row groups of CSV_ROWS_PER_DOC as pseudo-documents
+                           (header repeated per group so rows stay readable)
+    - .json/.jsonl      -> pretty-printed records, grouped like CSV rows
+    """
+    import csv as _csv
+    import io as _io
+
+    suffix = path.suffix.lower()
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        log.warning(f"Cannot read {path}: {e}")
+        return []
+
+    def doc(text, part=None):
+        fname = path.name if part is None else f"{path.stem}__part{part:04d}{path.suffix}"
+        return {"source": str(path), "filename": fname, "text": text,
+                "text_native": True}
+
+    if suffix in (".txt", ".md"):
+        return [doc(raw)] if raw.strip() else []
+
+    if suffix in (".html", ".htm"):
+        try:
+            from bs4 import BeautifulSoup
+            text = BeautifulSoup(raw, "html.parser").get_text(separator="\n")
+            text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+            return [doc(text)] if text else []
+        except ImportError:
+            return [doc(raw)]
+
+    if suffix == ".csv":
+        try:
+            rows = list(_csv.reader(_io.StringIO(raw)))
+        except _csv.Error as e:
+            log.warning(f"CSV parse failed for {path.name}: {e}")
+            return [doc(raw)]
+        if not rows:
+            return []
+        header, body = rows[0], rows[1:]
+        docs = []
+        for part, i in enumerate(range(0, len(body), CSV_ROWS_PER_DOC)):
+            lines = [", ".join(header)]
+            lines += [", ".join(str(c) for c in row) for row in body[i:i + CSV_ROWS_PER_DOC]]
+            docs.append(doc("\n".join(lines), part))
+        return docs
+
+    if suffix in (".json", ".jsonl"):
+        records = []
+        if suffix == ".jsonl":
+            for line in raw.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        records.append(line)
+        else:
+            try:
+                data = json.loads(raw)
+                records = data if isinstance(data, list) else [data]
+            except json.JSONDecodeError:
+                return [doc(raw)]
+        docs = []
+        for part, i in enumerate(range(0, len(records), CSV_ROWS_PER_DOC)):
+            chunk = records[i:i + CSV_ROWS_PER_DOC]
+            docs.append(doc("\n".join(json.dumps(r, ensure_ascii=False) for r in chunk), part))
+        return docs
+
+    return []
 
 
 # ─────────────────────────────────────────────
@@ -530,6 +677,38 @@ def enrich_all(docs: list[dict], llm_client) -> list[dict]:
         enriched_docs.append({**doc, **enriched})
     log.info(f"Enrichment complete for {len(enriched_docs)} documents.")
     return enriched_docs
+
+
+def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -> int:
+    """
+    Shared tail of the pipeline: dedupe -> enrich -> chunk -> embed -> store.
+
+    Text-native pseudo-documents (CSV/JSON row groups) skip LLM enrichment:
+    they are already structured, and enriching thousands of row groups
+    would burn tokens for no metadata gain. Returns the chunk count.
+    """
+    docs = deduplicate_texts(docs, threshold=0.85)
+
+    ocr_docs    = [d for d in docs if not d.get("text_native")]
+    native_docs = [d for d in docs if d.get("text_native")]
+
+    enriched_docs = []
+    if ocr_docs:
+        if enrich:
+            enriched_docs += enrich_all(ocr_docs, models.llm)
+        else:
+            enriched_docs += ocr_docs
+    for d in native_docs:
+        enriched_docs.append({
+            **d,
+            **_default_enrichment(d["filename"]),
+            "document_type": "structured_dataset",
+            "clean_text": d["text"],
+        })
+
+    chunks = chunk_documents(enriched_docs)
+    embed_and_store(chunks, models.embedder, models.collection)
+    return len(chunks)
 
 
 # ─────────────────────────────────────────────
@@ -823,25 +1002,19 @@ def ingest(zip_sources: list, force: bool = False):
 
     log.info(f"{len(pending)} ZIP(s) to process, {len(zip_paths) - len(pending)} already done.")
 
-    # Only load heavy models if there is actual work to do
-    processor, ocr_model = load_ocr_model()
-    embedder             = load_embed_model()
-    collection           = load_vectordb()
-    llm_client           = load_llm_client()
+    # Lazily loaded — nothing heavy loads until a document actually needs it
+    models = Models()
 
     for zip_path in pending:
         log.info(f"Processing: {zip_path.name}")
         try:
             extracted_dir = extract_zip(zip_path)
             files         = collect_files(extracted_dir, prefer="pdf")
-            docs          = process_files(files, processor, ocr_model)
-            docs          = deduplicate_texts(docs, threshold=0.85)
-            enriched_docs = enrich_all(docs, llm_client)
-            chunks        = chunk_documents(enriched_docs)
-            embed_and_store(chunks, embedder, collection)
+            docs          = process_files(files, models)
+            chunks        = process_doc_batch(docs, models)
 
             mark_completed(progress, zip_path, doc_count=len(docs))
-            log.info(f"Done: {zip_path.name} ({len(docs)} docs, {len(chunks)} chunks)")
+            log.info(f"Done: {zip_path.name} ({len(docs)} docs, {chunks} chunks)")
 
         except Exception as e:
             log.error(f"Failed: {zip_path.name}: {e}", exc_info=True)
@@ -856,6 +1029,105 @@ def ingest(zip_sources: list, force: bool = False):
 
     print_progress_report(progress)
     log.info("Ingestion complete.")
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+
+
+def ingest_tree(root: str, force: bool = False, enrich: bool = True):
+    """
+    Ingest an arbitrary directory tree — the shape downloader.py produces
+    (data/downloads/<source_id>/...), including git clones and IA mirrors:
+
+      *.zip                  -> the classic ZIP flow (extract/OCR/enrich)
+      *.pdf, images          -> OCR (or PDF text layer) + enrichment
+      *.txt/.csv/.json/.html -> text-native ingestion, no OCR, no enrichment
+
+    Loose files are processed in batches per top-level subdirectory (one
+    batch per source), and tracked in the progress ledger by relative path
+    + SHA-256 so re-runs only touch new material.
+    """
+    setup_dirs()
+    progress = load_progress()
+    root_path = Path(root)
+    if not root_path.exists():
+        raise FileNotFoundError(f"Ingest root not found: {root}")
+
+    models = Models()
+
+    # 1. ZIPs go through the battle-tested ZIP flow
+    for zip_path in sorted(root_path.rglob("*.zip")):
+        if not force and is_already_done(progress, zip_path):
+            log.info(f"Skipping (already processed): {zip_path.name}")
+            continue
+        log.info(f"Processing ZIP: {zip_path}")
+        try:
+            extracted_dir = extract_zip(zip_path)
+            files         = collect_files(extracted_dir, prefer="pdf")
+            docs          = process_files(files, models)
+            chunks        = process_doc_batch(docs, models, enrich=enrich)
+            mark_completed(progress, zip_path, doc_count=len(docs))
+            log.info(f"Done: {zip_path.name} ({len(docs)} docs, {chunks} chunks)")
+        except Exception as e:
+            log.error(f"Failed: {zip_path.name}: {e}", exc_info=True)
+            mark_failed(progress, zip_path, error=str(e))
+
+    # 2. Loose files, batched per top-level subdirectory (= per source)
+    subdirs = sorted(d for d in root_path.iterdir() if d.is_dir()) or [root_path]
+    for subdir in subdirs:
+        loose = [p for p in sorted(subdir.rglob("*"))
+                 if p.is_file()
+                 and ".git" not in p.parts
+                 and p.suffix.lower() != ".zip"
+                 and (p.suffix.lower() == ".pdf"
+                      or p.suffix.lower() in IMAGE_EXTS
+                      or p.suffix.lower() in TEXT_NATIVE_EXTS)]
+
+        pending = []
+        for p in loose:
+            key = str(p.relative_to(root_path))
+            entry = progress["completed"].get(key)
+            if not force and entry and entry.get("sha256") == file_sha256(p):
+                continue
+            pending.append(p)
+
+        if not pending:
+            continue
+        log.info(f"── Ingesting {len(pending)} loose file(s) from {subdir}")
+
+        docs = []
+        files = {"pdfs": [], "images": []}
+        for p in pending:
+            suffix = p.suffix.lower()
+            try:
+                if suffix == ".pdf":
+                    files["pdfs"].append(p)
+                elif suffix in IMAGE_EXTS:
+                    files["images"].append(p)
+                else:
+                    docs.extend(read_text_native(p))
+            except Exception as e:
+                log.error(f"Failed to read {p}: {e}")
+
+        try:
+            docs = process_files(files, models) + docs
+            chunks = process_doc_batch(docs, models, enrich=enrich)
+            for p in pending:
+                progress["completed"][str(p.relative_to(root_path))] = {
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "sha256":       file_sha256(p),
+                    "path":         str(p),
+                    "doc_count":    1,
+                }
+            save_progress(progress)
+            log.info(f"Done: {subdir.name} ({len(docs)} docs, {chunks} chunks)")
+        except Exception as e:
+            log.error(f"Batch failed for {subdir}: {e}", exc_info=True)
+            for p in pending:
+                mark_failed(progress, p, error=str(e))
+
+    print_progress_report(progress)
+    log.info("Tree ingestion complete.")
 
 
 if __name__ == "__main__":
