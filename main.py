@@ -11,8 +11,15 @@ import os
 import json
 import zipfile
 import logging
+import threading
 import requests
 import torch
+from concurrent.futures import ThreadPoolExecutor
+
+# Enrichment API calls are I/O-bound; run several concurrently. The shared
+# training-JSONL append is guarded by a lock so records never interleave.
+ENRICH_MAX_WORKERS = 6
+_TRAINING_LOCK = threading.Lock()
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -43,7 +50,7 @@ DIRS = {
 
 OCR_MODEL_ID    = "zai-org/GLM-OCR"
 EMBED_MODEL_ID  = "BAAI/bge-base-en-v1.5"
-LLM_MODEL       = "claude-sonnet-4-20250514"
+LLM_MODEL       = "claude-sonnet-4-6"
 COLLECTION_NAME = "uap_documents"
 
 CHUNK_SIZE     = 512
@@ -571,21 +578,32 @@ def enrich_document(doc: dict, llm_client) -> dict:
     try:
         response = llm_client.messages.create(
             model=LLM_MODEL,
-            max_tokens=4096,
+            # Response echoes back full clean_text + metadata + up to 8 Q&A pairs;
+            # 4096 truncated larger docs mid-JSON → parse failure → empty default.
+            # 16384 gives headroom for large docs; you only pay for tokens used.
+            max_tokens=16384,
             system=ENRICHMENT_SYSTEM_PROMPT,
             messages=[{
                 "role": "user",
                 "content": ENRICHMENT_USER_PROMPT.format(text=text_sample),
             }],
         )
-        raw = response.content[0].text.strip()
 
-        # Strip any accidental markdown fences
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        enriched = json.loads(raw)
+        # The model can decline via stop_reason="refusal" with empty content
+        # (common on declassified intelligence docs). Detect it explicitly so
+        # it's logged as a refusal, not a cryptic "list index out of range".
+        if response.stop_reason == "refusal" or not response.content:
+            log.warning(f"Enrichment refused by model for {doc['filename']} "
+                        f"(stop_reason={response.stop_reason}); using defaults.")
+            enriched = _default_enrichment(doc["filename"])
+        else:
+            raw = response.content[0].text.strip()
+            # Strip any accidental markdown fences
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            enriched = json.loads(raw)
 
     except (json.JSONDecodeError, Exception) as e:
         log.warning(f"Enrichment failed for {doc['filename']}: {e}. Using defaults.")
@@ -650,7 +668,8 @@ def _append_training_data(enriched: dict):
         f"Document text:\n{enriched.get('clean_text', '')[:3000]}"
     )
 
-    with open(training_path, "a", encoding="utf-8") as f:
+    # Guard the shared append so concurrent enrichment threads don't interleave.
+    with _TRAINING_LOCK, open(training_path, "a", encoding="utf-8") as f:
         for qa in enriched.get("qa_pairs", []):
             record = {
                 "system": system_ctx,
@@ -671,10 +690,16 @@ def _append_training_data(enriched: dict):
 
 
 def enrich_all(docs: list[dict], llm_client) -> list[dict]:
-    enriched_docs = []
-    for doc in tqdm(docs, desc="LLM enrichment"):
-        enriched = enrich_document(doc, llm_client)
-        enriched_docs.append({**doc, **enriched})
+    # Fan out the (I/O-bound) enrichment calls across a thread pool. Cached
+    # docs return immediately; each writes its own per-file JSON, and the
+    # training-JSONL append is lock-guarded. Order is preserved to stay
+    # aligned with `docs`.
+    workers = min(ENRICH_MAX_WORKERS, len(docs)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(tqdm(
+            pool.map(lambda d: enrich_document(d, llm_client), docs),
+            total=len(docs), desc="LLM enrichment"))
+    enriched_docs = [{**doc, **enriched} for doc, enriched in zip(docs, results)]
     log.info(f"Enrichment complete for {len(enriched_docs)} documents.")
     return enriched_docs
 
@@ -687,10 +712,14 @@ def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -
     they are already structured, and enriching thousands of row groups
     would burn tokens for no metadata gain. Returns the chunk count.
     """
-    docs = deduplicate_texts(docs, threshold=0.85)
-
+    # Content dedup is an O(n²) shingle comparison — worthwhile only for OCR'd
+    # documents with unrelated filenames. Structured/text-native pseudo-docs
+    # (CSV/JSON row groups) are numerous and identity-stable, so deduping them
+    # is both semantically wrong and prohibitively slow (thousands of rows →
+    # millions of pairwise comparisons that peg one CPU for many minutes).
     ocr_docs    = [d for d in docs if not d.get("text_native")]
     native_docs = [d for d in docs if d.get("text_native")]
+    ocr_docs    = deduplicate_texts(ocr_docs, threshold=0.85)
 
     enriched_docs = []
     if ocr_docs:
@@ -728,7 +757,11 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
     )
     chunks = []
     for doc in docs:
-        text_to_chunk = doc.get("clean_text") or doc.get("text", "")
+        # Chunk the FULL document text. clean_text is only the cleaned first
+        # ~12k-char enrichment sample (≈3% of long docs), so using it here
+        # silently dropped ~96% of large documents from the index. clean_text
+        # stays for enrichment metadata + the training set, not for retrieval.
+        text_to_chunk = doc.get("text") or doc.get("clean_text", "")
         if not text_to_chunk.strip():
             log.warning(f"Empty text for {doc['filename']}, skipping.")
             continue
@@ -769,8 +802,18 @@ def embed_and_store(chunks: list[dict], embedder, collection):
         log.warning("No chunks to embed.")
         return
 
+    import hashlib
+    # Key on filename, not source: CSV/JSON row-group pseudo-docs share one
+    # source path but get unique filenames ("foo__part0007.csv"), so keying on
+    # source stem collides across all parts. A short source-path hash also
+    # disambiguates identical filenames from different sources. Deterministic,
+    # so re-runs upsert idempotently.
+    def _chunk_key(c):
+        src_tag = hashlib.sha1(c["source"].encode("utf-8")).hexdigest()[:8]
+        return f"{Path(c['filename']).stem}_{src_tag}_chunk_{c['chunk_id']}"
+
     texts     = [c["text"] for c in chunks]
-    ids       = [f"{Path(c['source']).stem}_chunk_{c['chunk_id']}" for c in chunks]
+    ids       = [_chunk_key(c) for c in chunks]
     metadatas = [{k: v for k, v in c.items() if k != "text"} for c in chunks]
 
     log.info(f"Embedding {len(texts)} chunks...")

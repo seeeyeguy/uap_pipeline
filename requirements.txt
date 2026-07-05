@@ -28,6 +28,9 @@ beautifulsoup4>=4.12.0
 
 # PDF text-layer fast path (skips GPU OCR for born-digital PDFs)
 pypdf>=4.0.0
+# lets pypdf read AES-encrypted (but born-digital) gov PDFs via the text layer
+# instead of falling back to slow GPU OCR
+cryptography>=3.1
 
 # LLM enrichment
 anthropic>=0.28.0

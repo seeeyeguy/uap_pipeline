@@ -197,6 +197,22 @@ def scrape_cia(session, opts) -> list[dict]:
         "https://www.cia.gov/readingroom/search/site/ufo",
         "https://www.cia.gov/readingroom/search/site/unidentified%20flying%20object",
     ]
+
+    # Reachability probe: as of 2026 the entire cia.gov/readingroom is behind
+    # Akamai bot mitigation that 302-redirect-loops every non-browser request
+    # (even the homepage), so requests-based scraping returns nothing. Detect
+    # that up front and fail loudly with guidance instead of a silent zero —
+    # a URL/parse fix can't defeat a JS challenge; that needs a real browser
+    # or an alternate mirror (Black Vault CIA collection, archive.org).
+    probe = _get(session, "https://www.cia.gov/readingroom/")
+    if probe is None or "/readingroom" not in probe.text[:5000].lower():
+        log.warning(
+            "CIA reading room unreachable (Akamai bot-block / redirect loop). "
+            "Scraper cannot enumerate it with plain HTTP. Get CIA UFO docs via "
+            "the 'blackvault' (CIA collection) or 'internet_archive' sources, or "
+            "add browser-based fetching.")
+        return []
+
     for seed in seeds:
         for page_n in range(max_pages):
             url = seed if page_n == 0 else f"{seed}?page={page_n}"
@@ -230,10 +246,10 @@ def scrape_cia(session, opts) -> list[dict]:
 FBI_COLLECTIONS = [
     "https://vault.fbi.gov/UFO",
     "https://vault.fbi.gov/Majestic%2012",
-    "https://vault.fbi.gov/Guy%20Hottel",
     "https://vault.fbi.gov/Roswell%20UFO",
-    "https://vault.fbi.gov/Project%20Blue%20Book%20(UFO)",
     "https://vault.fbi.gov/unexplained-phenomenon",
+    # NB: the old "Guy Hottel" and "Project Blue Book (UFO)" folders now 404 —
+    # the Vault reorganized. Add current folder URLs here if they return.
 ]
 
 def scrape_fbi(session, opts) -> list[dict]:
@@ -250,11 +266,15 @@ def scrape_fbi(session, opts) -> list[dict]:
         for a in soup.find_all("a", href=True):
             href = urljoin(folder, a["href"]).split("#")[0]
             path = urlparse(href).path
+            # The Vault now links each document part as <collection>/<Part NN>/view;
+            # the PDF lives at <collection>/<Part NN>/at_download/file. (The old
+            # scraper excluded /view links and so found nothing.)
             if (urlparse(href).netloc == "vault.fbi.gov"
                     and path.startswith(urlparse(folder).path + "/")
-                    and not path.endswith(("/view", "/at_download/file"))
-                    and href not in part_pages):
-                part_pages.append(href)
+                    and path.endswith("/view")):
+                base = href[:-len("/view")].rstrip("/")
+                if base not in part_pages:
+                    part_pages.append(base)
         for part in part_pages:
             pdf = part.rstrip("/") + "/at_download/file"
             if pdf in seen:

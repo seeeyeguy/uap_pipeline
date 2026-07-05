@@ -148,7 +148,11 @@ def download_all(manifest: dict, only_sources: list[str] = None,
     """Download every manifest resource that passes the filters."""
     ledger = load_ledger()
     session = requests.Session()
-    session.headers.update({"User-Agent": "uap-pipeline/1.0 (archival research)"})
+    # Match scrapers.py: some gov WAFs (war.gov) 403 non-browser agents even
+    # though discovery with this UA succeeded, so downloads must use it too.
+    session.headers.update({"User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 uap-pipeline/1.0")})
 
     excluded = set(DEFAULT_EXCLUDED_KINDS)
     if include_videos:
@@ -179,6 +183,18 @@ def download_all(manifest: dict, only_sources: list[str] = None,
             result = _clone_repo(r["url"], source_dir)
         else:
             dest = source_dir / _safe_filename(r["url"])
+            # Some URLs carry no usable extension (e.g. FBI Vault's
+            # .../at_download/file). Without one, ingest_tree's suffix filter
+            # silently skips the file. Derive it from the manifest kind.
+            KIND_EXT = {"pdf": ".pdf", "zip": ".zip", "csv": ".csv",
+                        "json": ".json", "txt": ".txt", "html": ".html",
+                        "image": ".jpg"}
+            KNOWN = {".pdf", ".zip", ".csv", ".json", ".jsonl", ".txt", ".md",
+                     ".html", ".htm", ".jpg", ".jpeg", ".png", ".tif",
+                     ".tiff", ".djvu", ".gz"}
+            want = KIND_EXT.get(r.get("kind"))
+            if want and dest.suffix.lower() not in KNOWN:
+                dest = dest.with_name(dest.name + want)
             result = _download_file(session, r["url"], dest,
                                     expected_sha256=r.get("sha256"))
             if result.get("ok"):
