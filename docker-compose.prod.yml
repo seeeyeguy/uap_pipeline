@@ -1,0 +1,23 @@
+# Production: retriever sidecar on the VM, consumed by uap-api.
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Index delivery: build/refresh the index in dev, then
+#   rsync -a --delete data/vectordb/ prod-host:/srv/uap/vectordb/
+# (stop the container first, or rsync to a staging dir and swap — chroma's
+# sqlite must not change under a running process). The host dir must be
+# writable by uid 1000 (the container's `app` user).
+services:
+  retriever:
+    build:
+      context: .
+      dockerfile: Dockerfile.retriever
+    env_file:
+      - .env.production
+    restart: unless-stopped
+    # localhost-only: uap-api runs on the same VM and this service has no
+    # auth of its own. Widen deliberately if that changes.
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      # rw, not ro: chromadb opens its sqlite read-write even for queries
+      - /srv/uap/vectordb:/app/data/vectordb

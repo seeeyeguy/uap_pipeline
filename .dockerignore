@@ -1,0 +1,11 @@
+# The corpus, index, and caches must never end up in build context —
+# data/ alone is many GB.
+data/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.env
+.env.*
+!.env.example
+!.env.production.example

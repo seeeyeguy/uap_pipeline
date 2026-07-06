@@ -2,3 +2,9 @@ data/
 __pycache__/
 *.pyc
 .venv/
+
+# env files (templates *.example stay committed)
+.env
+.env.*
+!.env.example
+!.env.production.example

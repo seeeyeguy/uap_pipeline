@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────
+# UAP Retriever Sidecar — slim production deps
+# ─────────────────────────────────────────────
+# torch is intentionally NOT listed here: the Dockerfile installs it first
+# from the CPU (or CUDA) wheel index so the image doesn't pull the ~7GB
+# default CUDA build. See Dockerfile.retriever.
+#
+# These cover retriever.py plus main.py's top-level imports (retriever
+# imports load_embed_model/load_vectordb from main). Lazy imports used only
+# during ingestion (pypdf, beautifulsoup4, accelerate) are excluded.
+
+# a released transformers is fine here — the git checkout in requirements.txt
+# is only needed for GLM-OCR support, which the retriever never loads
+transformers>=4.44.0
+
+sentence-transformers>=3.0.0
+chromadb>=0.5.0
+
+# imported at main.py top level even though the retriever never calls them
+anthropic>=0.28.0
+pdf2image>=1.17.0
+Pillow>=10.0.0
+requests>=2.31.0
+tqdm>=4.66.0
+langchain-text-splitters>=0.2.0

@@ -1,0 +1,17 @@
+# Dev: run the retriever against the locally-built index.
+#   docker compose up --build
+# Ingestion itself stays outside Docker in dev (needs the GPU + venv);
+# this just lets you exercise the same container uap-api will talk to.
+services:
+  retriever:
+    build:
+      context: .
+      dockerfile: Dockerfile.retriever
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "127.0.0.1:8001:8001"
+    volumes:
+      # rw, not ro: chromadb opens its sqlite read-write even for queries
+      - ./data/vectordb:/app/data/vectordb

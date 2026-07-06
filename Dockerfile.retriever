@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────
+# UAP Retriever Sidecar
+# Serves POST /retrieve + GET /health for uap-api.
+# The ingestion pipeline (GPU OCR, enrichment) stays a dev-side workflow;
+# this image only embeds queries (bge-base) and reads the ChromaDB index,
+# which is volume-mounted at runtime — see docker-compose*.yml.
+# ─────────────────────────────────────────────
+FROM python:3.12-slim
+
+# CPU torch wheel (~200MB) instead of the default CUDA build (~7GB).
+# To run on a GPU host instead: swap the index URL for
+# https://download.pytorch.org/whl/cu128 and base the image on
+# nvidia/cuda:12.8.*-runtime-ubuntu24.04 + python.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements-retriever.txt /tmp/requirements-retriever.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-retriever.txt
+
+# Bake the embedding model into the image so startup needs no network
+# and no writable HF cache.
+ENV HF_HOME=/opt/hf-cache
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-base-en-v1.5')"
+
+WORKDIR /app
+COPY main.py retriever.py ./
+
+# 0.0.0.0 so the port is reachable from outside the container; compose
+# publishes it on localhost only. VECTORDB_DIR matches the compose mount.
+ENV RETRIEVER_HOST=0.0.0.0 \
+    RETRIEVER_PORT=8001 \
+    VECTORDB_DIR=/app/data/vectordb
+
+RUN useradd --create-home --uid 1000 app \
+    && mkdir -p /app/data/vectordb \
+    && chown -R app:app /app /opt/hf-cache
+USER app
+
+EXPOSE 8001
+
+# Model + index load takes a while on first boot; give it a grace period.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD python -c "import urllib.request,os; urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"RETRIEVER_PORT\"]}/health', timeout=4)"
+
+CMD ["python", "retriever.py"]
