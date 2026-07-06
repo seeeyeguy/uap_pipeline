@@ -91,7 +91,8 @@ def cmd_download(args, manifest: dict = None):
 
 def cmd_ingest(args):
     from main import ingest_tree
-    ingest_tree(args.downloads_dir, force=args.force, enrich=not args.no_enrich)
+    ingest_tree(args.downloads_dir, force=args.force, enrich=not args.no_enrich,
+                sources=_sources_list(args.sources))
 
 
 def cmd_all(args):

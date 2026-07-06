@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Enrichment API calls are I/O-bound; run several concurrently. The shared
 # training-JSONL append is guarded by a lock so records never interleave.
-ENRICH_MAX_WORKERS = 6
+ENRICH_MAX_WORKERS = int(os.environ.get("ENRICH_MAX_WORKERS", "6"))
 _TRAINING_LOCK = threading.Lock()
 from pathlib import Path
 from datetime import datetime
@@ -45,7 +45,7 @@ DIRS = {
     "text":      "./data/text",
     "enriched":  "./data/enriched",    # JSON metadata per document
     "training":  "./data/training",    # JSONL fine-tuning dataset
-    "vectordb":  "./data/vectordb",
+    "vectordb":  os.environ.get("VECTORDB_DIR", "./data/vectordb"),
 }
 
 OCR_MODEL_ID    = "zai-org/GLM-OCR"
@@ -953,8 +953,11 @@ def mark_completed(progress: dict, zip_path: Path, doc_count: int):
     save_progress(progress)
 
 
-def mark_failed(progress: dict, zip_path: Path, error: str):
-    progress["failed"][zip_path.name] = {
+def mark_failed(progress: dict, zip_path: Path, error: str, key: str | None = None):
+    # key lets callers use the same scoped key ("source/file.pdf") the success
+    # path writes; a later success must find and pop this exact entry, or the
+    # failure lingers in the ledger forever.
+    progress["failed"][key or zip_path.name] = {
         "failed_at": datetime.utcnow().isoformat(),
         "path":      str(zip_path),
         "error":     error,
@@ -1077,7 +1080,8 @@ def ingest(zip_sources: list, force: bool = False):
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 
 
-def ingest_tree(root: str, force: bool = False, enrich: bool = True):
+def ingest_tree(root: str, force: bool = False, enrich: bool = True,
+                sources: list[str] | None = None):
     """
     Ingest an arbitrary directory tree — the shape downloader.py produces
     (data/downloads/<source_id>/...), including git clones and IA mirrors:
@@ -1098,8 +1102,17 @@ def ingest_tree(root: str, force: bool = False, enrich: bool = True):
 
     models = Models()
 
+    def in_scope(p: Path) -> bool:
+        # top-level subdir under the downloads root = source id
+        if sources is None:
+            return True
+        rel = p.relative_to(root_path)
+        return bool(rel.parts) and rel.parts[0] in sources
+
     # 1. ZIPs go through the battle-tested ZIP flow
     for zip_path in sorted(root_path.rglob("*.zip")):
+        if not in_scope(zip_path):
+            continue
         if not force and is_already_done(progress, zip_path):
             log.info(f"Skipping (already processed): {zip_path.name}")
             continue
@@ -1116,7 +1129,9 @@ def ingest_tree(root: str, force: bool = False, enrich: bool = True):
             mark_failed(progress, zip_path, error=str(e))
 
     # 2. Loose files, batched per top-level subdirectory (= per source)
-    subdirs = sorted(d for d in root_path.iterdir() if d.is_dir()) or [root_path]
+    subdirs = sorted(d for d in root_path.iterdir()
+                     if d.is_dir() and (sources is None or d.name in sources)) \
+              or ([root_path] if sources is None else [])
     for subdir in subdirs:
         loose = [p for p in sorted(subdir.rglob("*"))
                  if p.is_file()
@@ -1156,18 +1171,22 @@ def ingest_tree(root: str, force: bool = False, enrich: bool = True):
             docs = process_files(files, models) + docs
             chunks = process_doc_batch(docs, models, enrich=enrich)
             for p in pending:
-                progress["completed"][str(p.relative_to(root_path))] = {
+                rel = str(p.relative_to(root_path))
+                progress["completed"][rel] = {
                     "completed_at": datetime.utcnow().isoformat(),
                     "sha256":       file_sha256(p),
                     "path":         str(p),
                     "doc_count":    1,
                 }
+                progress["failed"].pop(rel, None)
+                progress["failed"].pop(p.name, None)  # legacy bare-name keys
             save_progress(progress)
             log.info(f"Done: {subdir.name} ({len(docs)} docs, {chunks} chunks)")
         except Exception as e:
             log.error(f"Batch failed for {subdir}: {e}", exc_info=True)
             for p in pending:
-                mark_failed(progress, p, error=str(e))
+                mark_failed(progress, p, error=str(e),
+                            key=str(p.relative_to(root_path)))
 
     print_progress_report(progress)
     log.info("Tree ingestion complete.")
