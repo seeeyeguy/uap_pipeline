@@ -8,17 +8,16 @@ as both RAG context and future fine-tuning data for a domain-specific model.
 """
 
 import os
+import re
 import json
 import zipfile
 import logging
 import threading
 import requests
 import torch
-from concurrent.futures import ThreadPoolExecutor
 
-# Enrichment API calls are I/O-bound; run several concurrently. The shared
-# training-JSONL append is guarded by a lock so records never interleave.
-ENRICH_MAX_WORKERS = int(os.environ.get("ENRICH_MAX_WORKERS", "6"))
+# Guards the shared training-JSONL append (enrichment is single-threaded now
+# that it runs via the Batch API, but the lock is cheap insurance).
 _TRAINING_LOCK = threading.Lock()
 from pathlib import Path
 from datetime import datetime
@@ -49,7 +48,11 @@ DIRS = {
 }
 
 OCR_MODEL_ID    = "zai-org/GLM-OCR"
-EMBED_MODEL_ID  = "BAAI/bge-base-en-v1.5"
+# bge-m3: multilingual with cross-lingual alignment — English queries must
+# retrieve the Swedish/Spanish/Italian/Portuguese documents in this corpus.
+# Dimension change (768->1024) means any index built with bge-base is
+# incompatible; switched at the 2026-07 full rebuild.
+EMBED_MODEL_ID  = "BAAI/bge-m3"
 LLM_MODEL       = "claude-sonnet-4-6"
 COLLECTION_NAME = "uap_documents"
 
@@ -61,6 +64,10 @@ MAX_NEW_TOKENS = 8192
 # per page skip GPU OCR entirely (most modern government releases are
 # born-digital or already OCRed).
 TEXT_LAYER_MIN_CHARS_PER_PAGE = 200
+# Below this plausible-word ratio a text is treated as garbage OCR:
+# the PDF text layer is rejected (re-OCR instead) and LLM enrichment is
+# skipped (uncached, so it re-runs once better text exists).
+TEXT_LAYER_MIN_QUALITY = 0.30
 
 # Text-native formats ingested without OCR
 TEXT_NATIVE_EXTS = {".txt", ".md", ".csv", ".json", ".jsonl", ".html", ".htm"}
@@ -299,10 +306,28 @@ def ocr_image(image_path: Path, processor, model) -> str:
     ).strip()
 
 
+def text_quality_score(text: str) -> float:
+    """
+    Cheap lexical quality estimate: the fraction of tokens that look like
+    real words or numbers. Clean text (born-digital or good OCR) scores
+    0.6+; mangled embedded OCR layers from microfilm scans score under 0.2.
+    Very short texts return 1.0 — the ratio is too noisy to judge them.
+    """
+    tokens = text.split()
+    if len(tokens) < 20:
+        return 1.0
+    plausible = sum(
+        1 for t in tokens
+        if re.fullmatch(r"[A-Za-z]{3,}[.,;:!?)]?|\(?\d{1,4}([-/.:]\d{1,4})*[.,;:]?", t)
+    )
+    return plausible / len(tokens)
+
+
 def extract_pdf_text_layer(pdf_path: Path) -> Optional[str]:
     """
     Pull the embedded text layer from a PDF. Returns None when the PDF is
-    image-only (or too sparse), signalling that OCR is required.
+    image-only, too sparse, or the layer is garbage OCR (e.g. Internet
+    Archive microfilm scans) — all signalling that our own OCR is required.
     """
     try:
         from pypdf import PdfReader
@@ -312,6 +337,11 @@ def extract_pdf_text_layer(pdf_path: Path) -> Optional[str]:
             return None
         avg_chars = sum(len(p) for p in pages) / len(pages)
         if avg_chars < TEXT_LAYER_MIN_CHARS_PER_PAGE:
+            return None
+        score = text_quality_score(" ".join(pages))
+        if score < TEXT_LAYER_MIN_QUALITY:
+            log.info(f"Text layer is garbage (lexical score {score:.2f} < "
+                     f"{TEXT_LAYER_MIN_QUALITY}), falling back to OCR: {pdf_path.name}")
             return None
         return "\n\n".join(f"--- Page {i+1} ---\n{p}" for i, p in enumerate(pages))
     except Exception as e:
@@ -323,12 +353,20 @@ def ocr_pdf(pdf_path: Path, processor, model) -> str:
     img_dir = Path(DIRS["images"]) / pdf_path.stem
     img_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Converting PDF to images: {pdf_path.name}")
-    pages = convert_from_path(str(pdf_path), dpi=200)
+    # paths_only + output_folder: poppler streams each rendered page straight
+    # to disk, so memory stays flat at ~1 page. Holding the PIL images in RAM
+    # OOM-killed the process on a 1126-page scan (>11 GB of pixels).
+    img_paths = convert_from_path(
+        str(pdf_path),
+        dpi=200,
+        output_folder=str(img_dir),
+        fmt="jpeg",
+        output_file="page_",
+        paths_only=True,
+    )
     full_text = []
-    for i, page in enumerate(tqdm(pages, desc=f"OCR {pdf_path.name}")):
-        img_path = img_dir / f"page_{i+1:04d}.jpg"
-        page.save(str(img_path), "JPEG")
-        page_text = ocr_image(img_path, processor, model)
+    for i, img_path in enumerate(tqdm(img_paths, desc=f"OCR {pdf_path.name}")):
+        page_text = ocr_image(Path(img_path), processor, model)
         full_text.append(f"--- Page {i+1} ---\n{page_text}")
     return "\n\n".join(full_text)
 
@@ -397,27 +435,37 @@ def deduplicate_texts(docs: list[dict], threshold: float = 0.85) -> list[dict]:
 def process_files(files: dict, models: "Models", force_ocr: bool = False) -> list[dict]:
     results = []
     for pdf in files["pdfs"]:
-        txt_path = Path(DIRS["text"]) / (pdf.stem + ".txt")
-        if txt_path.exists():
-            log.info(f"Skipping OCR (cached): {pdf.name}")
-            text = txt_path.read_text(encoding="utf-8")
-        else:
-            text = None if force_ocr else extract_pdf_text_layer(pdf)
-            if text:
-                log.info(f"Text layer found, skipping OCR: {pdf.name}")
+        # Per-file guard: archives contain the occasional corrupt PDF
+        # (broken XRef tables etc.) — one must never abort the whole batch.
+        try:
+            txt_path = Path(DIRS["text"]) / (pdf.stem + ".txt")
+            if txt_path.exists():
+                log.info(f"Skipping OCR (cached): {pdf.name}")
+                text = txt_path.read_text(encoding="utf-8")
             else:
-                text = ocr_pdf(pdf, *models.ocr)
-            save_text(text, pdf)
+                text = None if force_ocr else extract_pdf_text_layer(pdf)
+                if text:
+                    log.info(f"Text layer found, skipping OCR: {pdf.name}")
+                else:
+                    text = ocr_pdf(pdf, *models.ocr)
+                save_text(text, pdf)
+        except Exception as e:
+            log.error(f"Unprocessable PDF, skipping: {pdf.name}: {e}")
+            continue
         results.append({"source": str(pdf), "filename": pdf.name, "text": text})
 
     for img in files["images"]:
-        txt_path = Path(DIRS["text"]) / (img.stem + ".txt")
-        if txt_path.exists():
-            log.info(f"Skipping OCR (cached): {img.name}")
-            text = txt_path.read_text(encoding="utf-8")
-        else:
-            text = ocr_image(img, *models.ocr)
-            save_text(text, img)
+        try:
+            txt_path = Path(DIRS["text"]) / (img.stem + ".txt")
+            if txt_path.exists():
+                log.info(f"Skipping OCR (cached): {img.name}")
+                text = txt_path.read_text(encoding="utf-8")
+            else:
+                text = ocr_image(img, *models.ocr)
+                save_text(text, img)
+        except Exception as e:
+            log.error(f"Unprocessable image, skipping: {img.name}: {e}")
+            continue
         results.append({"source": str(img), "filename": img.name, "text": text})
 
     return results
@@ -538,7 +586,8 @@ ENRICHMENT_USER_PROMPT = """Analyze the following document text and return a JSO
   }},
   "topics": ["list of relevant topic tags, e.g. close_encounter, abduction, crash_retrieval, government_coverup, military_encounter, nuclear_connection, mass_sighting"],
   "time_period": "one of: [pre_1947, 1947_1969, 1970_1989, 1990_2009, 2010_present, unknown]",
-  "clean_text": "The document text cleaned of OCR artifacts, headers/footers, page numbers, and formatting noise. Preserve all substantive content.",
+  "ocr_quality": "one of: [good, degraded, garbage] — good: text is clean and complete; degraded: legible but with OCR noise, gaps, or garbled passages; garbage: mostly unreadable, not usable as source material",
+  "ocr_notes": "one short sentence describing any OCR/legibility problems, or null if none",
   "qa_pairs": [
     {{
       "question": "A natural question a researcher or journalist would ask about this document",
@@ -548,7 +597,8 @@ ENRICHMENT_USER_PROMPT = """Analyze the following document text and return a JSO
   ]
 }}
 
-Generate between 3 and 8 qa_pairs depending on document richness. Questions should cover:
+If ocr_quality is "garbage", return an empty qa_pairs array — do not fabricate answers from unreadable text.
+Otherwise generate between 3 and 8 qa_pairs depending on document richness. Questions should cover:
 - What happened / what is described
 - Who was involved
 - When and where
@@ -559,66 +609,81 @@ Document text:
 {text}"""
 
 
-def enrich_document(doc: dict, llm_client) -> dict:
-    """
-    Pass document text through Claude to extract structured metadata
-    and generate Q&A pairs for both RAG and future model training.
-    """
-    cache_path = Path(DIRS["enriched"]) / (Path(doc["filename"]).stem + ".json")
-    if cache_path.exists():
-        log.info(f"Skipping enrichment (cached): {doc['filename']}")
-        return json.loads(cache_path.read_text(encoding="utf-8"))
+def _enrichment_cache_path(doc: dict) -> Path:
+    return Path(DIRS["enriched"]) / (Path(doc["filename"]).stem + ".json")
 
-    log.info(f"Enriching: {doc['filename']}")
 
-    # Truncate very long texts to avoid huge token bills
-    # Enrichment works on a representative sample; full text goes to chunking
+def _enrichment_request_params(doc: dict) -> dict:
+    """Messages-API params for one enrichment call — shared by the sync and
+    Batch API paths so both produce byte-identical requests."""
+    # Truncate very long texts to avoid huge token bills.
+    # Enrichment works on a representative sample; full text goes to chunking.
     text_sample = doc["text"][:12000]
+    return {
+        "model": LLM_MODEL,
+        # Output is metadata + up to 8 Q&A pairs (~1-2k tokens) — the old
+        # clean_text echo is gone, so 4096 is comfortable headroom.
+        "max_tokens": 4096,
+        "system": ENRICHMENT_SYSTEM_PROMPT,
+        "messages": [{
+            "role": "user",
+            "content": ENRICHMENT_USER_PROMPT.format(text=text_sample),
+        }],
+    }
 
+
+def _parse_enrichment_response(doc: dict, response) -> dict:
+    """Turn a Messages API response into an enriched dict (defaults on
+    refusal or parse failure)."""
     try:
-        response = llm_client.messages.create(
-            model=LLM_MODEL,
-            # Response echoes back full clean_text + metadata + up to 8 Q&A pairs;
-            # 4096 truncated larger docs mid-JSON → parse failure → empty default.
-            # 16384 gives headroom for large docs; you only pay for tokens used.
-            max_tokens=16384,
-            system=ENRICHMENT_SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": ENRICHMENT_USER_PROMPT.format(text=text_sample),
-            }],
-        )
-
         # The model can decline via stop_reason="refusal" with empty content
         # (common on declassified intelligence docs). Detect it explicitly so
         # it's logged as a refusal, not a cryptic "list index out of range".
         if response.stop_reason == "refusal" or not response.content:
             log.warning(f"Enrichment refused by model for {doc['filename']} "
                         f"(stop_reason={response.stop_reason}); using defaults.")
-            enriched = _default_enrichment(doc["filename"])
-        else:
-            raw = response.content[0].text.strip()
-            # Strip any accidental markdown fences
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            enriched = json.loads(raw)
-
+            return _default_enrichment(doc["filename"])
+        raw = response.content[0].text.strip()
+        # Strip any accidental markdown fences
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw)
     except (json.JSONDecodeError, Exception) as e:
         log.warning(f"Enrichment failed for {doc['filename']}: {e}. Using defaults.")
-        enriched = _default_enrichment(doc["filename"])
+        return _default_enrichment(doc["filename"])
 
-    # Attach source info
+
+def enrich_document(doc: dict, llm_client) -> dict:
+    """
+    Pass document text through Claude to extract structured metadata
+    and generate Q&A pairs for both RAG and future model training.
+    """
+    cache_path = _enrichment_cache_path(doc)
+    if cache_path.exists():
+        log.info(f"Skipping enrichment (cached): {doc['filename']}")
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+
+    log.info(f"Enriching: {doc['filename']}")
+    response = llm_client.messages.create(**_enrichment_request_params(doc))
+    enriched = _parse_enrichment_response(doc, response)
+
+    return _finalize_enrichment(doc, enriched)
+
+
+def _finalize_enrichment(doc: dict, enriched: dict) -> dict:
+    """Attach source info, write the per-doc cache, and append training data."""
     enriched["source"]       = doc["source"]
     enriched["filename"]     = doc["filename"]
     enriched["ingested_at"]  = datetime.utcnow().isoformat()
 
-    # Cache enriched JSON to disk
-    cache_path.write_text(json.dumps(enriched, indent=2, ensure_ascii=False), encoding="utf-8")
+    _enrichment_cache_path(doc).write_text(
+        json.dumps(enriched, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Append Q&A pairs to the training JSONL dataset
-    _append_training_data(enriched)
+    # Append Q&A pairs to the training JSONL dataset (raw text as context —
+    # the LLM-cleaned echo was dropped; see ocr_quality instead)
+    _append_training_data(enriched, doc_text=doc.get("text", ""))
 
     return enriched
 
@@ -641,12 +706,13 @@ def _default_enrichment(filename: str) -> dict:
         },
         "topics": [],
         "time_period": "unknown",
-        "clean_text": "",
+        "ocr_quality": "unknown",
+        "ocr_notes": None,
         "qa_pairs": [],
     }
 
 
-def _append_training_data(enriched: dict):
+def _append_training_data(enriched: dict, doc_text: str = ""):
     """
     Write Q&A pairs to a JSONL file in a format compatible with:
       - Anthropic fine-tuning API
@@ -665,8 +731,13 @@ def _append_training_data(enriched: dict):
         f"Source: {enriched.get('filename', 'unknown')}\n"
         f"Type: {enriched.get('document_type', 'unknown')}\n"
         f"Summary: {enriched.get('summary', '')}\n\n"
-        f"Document text:\n{enriched.get('clean_text', '')[:3000]}"
+        f"Document text:\n{doc_text[:3000]}"
     )
+
+    # Garbage-OCR docs produce no usable Q&A pairs, and any that slip through
+    # would poison the fine-tuning set with answers grounded in noise.
+    if enriched.get("ocr_quality") == "garbage":
+        return
 
     # Guard the shared append so concurrent enrichment threads don't interleave.
     with _TRAINING_LOCK, open(training_path, "a", encoding="utf-8") as f:
@@ -689,18 +760,108 @@ def _append_training_data(enriched: dict):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _enrich_via_batch_api(docs: list[dict], llm_client):
+    """
+    Enrich via the Message Batches API — 50% off all token usage, and this
+    workload is exactly batch-shaped (thousands of independent docs, zero
+    latency sensitivity). Most batches complete within an hour.
+
+    Succeeded results are cached like the sync path. Errored/expired results
+    write NO cache, so the next run retries them (a cached default would
+    never retry — the cache-of-failures trap).
+    """
+    import time
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+
+    BATCH_CHUNK = 1000  # well under the 100k-request/256MB limits; bounds blast radius
+
+    for start in range(0, len(docs), BATCH_CHUNK):
+        group = docs[start:start + BATCH_CHUNK]
+        by_id = {f"doc-{start + i}": d for i, d in enumerate(group)}
+        batch = llm_client.messages.batches.create(requests=[
+            Request(custom_id=cid,
+                    params=MessageCreateParamsNonStreaming(**_enrichment_request_params(d)))
+            for cid, d in by_id.items()
+        ])
+        log.info(f"Enrichment batch {batch.id}: {len(group)} docs submitted "
+                 f"({start + len(group)}/{len(docs)} total). Polling…")
+
+        while True:
+            b = llm_client.messages.batches.retrieve(batch.id)
+            if b.processing_status == "ended":
+                break
+            c = b.request_counts
+            log.info(f"  batch {batch.id}: {c.succeeded} ok, {c.errored} err, "
+                     f"{c.processing} processing")
+            time.sleep(30)
+
+        for result in llm_client.messages.batches.results(batch.id):
+            doc = by_id[result.custom_id]
+            if result.result.type == "succeeded":
+                enriched = _parse_enrichment_response(doc, result.result.message)
+                _finalize_enrichment(doc, enriched)
+            else:
+                # No cache written → retried on the next run
+                log.warning(f"Batch enrichment {result.result.type} for "
+                            f"{doc['filename']} — will retry next run.")
+
+
 def enrich_all(docs: list[dict], llm_client) -> list[dict]:
-    # Fan out the (I/O-bound) enrichment calls across a thread pool. Cached
-    # docs return immediately; each writes its own per-file JSON, and the
-    # training-JSONL append is lock-guarded. Order is preserved to stay
-    # aligned with `docs`.
-    workers = min(ENRICH_MAX_WORKERS, len(docs)) or 1
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(tqdm(
-            pool.map(lambda d: enrich_document(d, llm_client), docs),
-            total=len(docs), desc="LLM enrichment"))
-    enriched_docs = [{**doc, **enriched} for doc, enriched in zip(docs, results)]
-    log.info(f"Enrichment complete for {len(enriched_docs)} documents.")
+    # Hard pause: while data/ENRICH_PAUSED exists, no enrichment API calls are
+    # made and nothing is cached — cached results are still used, uncached
+    # docs get defaults and will enrich normally once the sentinel is removed.
+    if (Path(DIRS["text"]).parent / "ENRICH_PAUSED").exists():
+        log.warning(f"ENRICH_PAUSED sentinel present — skipping enrichment API "
+                    f"calls for {len(docs)} doc(s) (rm data/ENRICH_PAUSED to resume).")
+        out = []
+        for doc in docs:
+            cache = _enrichment_cache_path(doc)
+            enriched = (json.loads(cache.read_text(encoding="utf-8"))
+                        if cache.exists() else _default_enrichment(doc["filename"]))
+            out.append({**doc, **enriched})
+        return out
+
+    # Quality gate: don't pay to enrich text the OCR mangled — metadata and
+    # Q&A pairs generated from garbage text are worthless, and these docs
+    # will be re-OCR'd. No cache is written for skipped docs, so enrichment
+    # runs (once) as soon as better text exists.
+    skipped_keys = {
+        id(d) for d in docs
+        if not _enrichment_cache_path(d).exists()
+        and text_quality_score(d.get("text", "")) < TEXT_LAYER_MIN_QUALITY
+    }
+    if skipped_keys:
+        log.info(f"Enrichment skipped for {len(skipped_keys)} low-quality doc(s) "
+                 f"(lexical score < {TEXT_LAYER_MIN_QUALITY}) — deferred until re-OCR.")
+
+    pending = [d for d in docs
+               if id(d) not in skipped_keys and not _enrichment_cache_path(d).exists()]
+
+    # Batch API for real workloads; the sync path for tiny runs (batch
+    # round-trip latency isn't worth it) or when forced via ENRICH_SYNC=1.
+    if pending:
+        if len(pending) <= 5 or os.environ.get("ENRICH_SYNC") == "1":
+            for d in tqdm(pending, desc="LLM enrichment (sync)"):
+                enrich_document(d, llm_client)
+        else:
+            _enrich_via_batch_api(pending, llm_client)
+
+    enriched_docs = []
+    for doc in docs:
+        cache = _enrichment_cache_path(doc)
+        if id(doc) in skipped_keys:
+            enriched = _default_enrichment(doc["filename"])
+            enriched["ocr_quality"] = "garbage"
+            enriched["ocr_notes"] = "enrichment skipped by lexical quality gate"
+        elif cache.exists():
+            enriched = json.loads(cache.read_text(encoding="utf-8"))
+        else:
+            # batch result errored/expired — defaults for this run, no cache
+            enriched = _default_enrichment(doc["filename"])
+        enriched_docs.append({**doc, **enriched})
+    log.info(f"Enrichment complete for {len(enriched_docs)} documents "
+             f"({len(pending)} newly enriched, {len(skipped_keys)} quality-gated).")
     return enriched_docs
 
 
@@ -732,7 +893,7 @@ def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -
             **d,
             **_default_enrichment(d["filename"]),
             "document_type": "structured_dataset",
-            "clean_text": d["text"],
+            "ocr_quality": "good",  # text-native — no OCR involved
         })
 
     chunks = chunk_documents(enriched_docs)
@@ -746,9 +907,9 @@ def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -
 
 def chunk_documents(docs: list[dict]) -> list[dict]:
     """
-    Chunk using clean_text if available (LLM-cleaned), else raw OCR text.
-    All enriched metadata is attached to every chunk so filtering works
-    at query time without needing a separate metadata store.
+    Chunk the raw document text. All enriched metadata is attached to every
+    chunk so filtering works at query time without needing a separate
+    metadata store.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -757,17 +918,23 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
     )
     chunks = []
     for doc in docs:
-        # Chunk the FULL document text. clean_text is only the cleaned first
-        # ~12k-char enrichment sample (≈3% of long docs), so using it here
-        # silently dropped ~96% of large documents from the index. clean_text
-        # stays for enrichment metadata + the training set, not for retrieval.
-        text_to_chunk = doc.get("text") or doc.get("clean_text", "")
+        # Chunk the FULL raw document text — never an enrichment-derived
+        # sample. (The old clean_text echo covered only the first ~12k chars
+        # and silently dropped ~96% of large documents from the index.)
+        text_to_chunk = doc.get("text", "")
         if not text_to_chunk.strip():
             log.warning(f"Empty text for {doc['filename']}, skipping.")
             continue
 
         splits = splitter.split_text(text_to_chunk)
-        for i, split in enumerate(splits):
+        # English enrichment summary as an auxiliary chunk (chunk_id -1):
+        # gives every document — especially non-English ones — an English
+        # semantic entry point in the index, on top of bge-m3's native
+        # cross-lingual matching.
+        summary = (doc.get("summary") or "").strip()
+        if summary:
+            splits = [summary] + splits
+        for i, split in enumerate(splits, start=(-1 if summary else 0)):
             chunks.append({
                 "text":                 split,
                 "source":               doc["source"],
@@ -780,6 +947,7 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
                 "country":              (doc.get("event_location") or {}).get("country") or "",
                 "time_period":          doc.get("time_period", "unknown"),
                 "classification_level": doc.get("classification_level", "unknown"),
+                "ocr_quality":          doc.get("ocr_quality", "unknown"),
                 "topics":               json.dumps(doc.get("topics", [])),
                 "people":               json.dumps((doc.get("entities") or {}).get("people", [])),
                 "organizations":        json.dumps((doc.get("entities") or {}).get("organizations", [])),

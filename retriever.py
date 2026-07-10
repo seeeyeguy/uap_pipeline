@@ -4,7 +4,7 @@ UAP Retrieval Sidecar
 ---------------------
 A tiny HTTP service that the Go API (uap-api) calls for research-mode RAG.
 
-It reuses the pipeline's *exact* embedding model (BAAI/bge-base-en-v1.5) and
+It reuses the pipeline's *exact* embedding model (BAAI/bge-m3) and
 ChromaDB store (data/vectordb, collection "uap_documents"), so a query lands in
 the same 768-dim embedding space the corpus was built in. The Go server can't
 do this itself: Chroma's default embedder is a different model/dimension, which
@@ -15,7 +15,7 @@ Endpoints:
        -> {"chunks": [{"id","text","distance","source","document_type","summary"}]}
   GET  /health    -> {"status":"ok","collection":..,"chunks":N}
 
-Run (from the pipeline venv, so bge-base + the GPU are available):
+Run (from the pipeline venv, so bge-m3 + the GPU are available):
   source .venv/bin/activate
   RETRIEVER_PORT=8001 python retriever.py
 """
@@ -35,7 +35,7 @@ log = logging.getLogger("retriever")
 HOST = os.environ.get("RETRIEVER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("RETRIEVER_PORT", "8001"))
 
-log.info("Loading embedder + vector DB (this pulls the bge-base model)…")
+log.info("Loading embedder + vector DB (this pulls the bge-m3 model)…")
 EMBEDDER = load_embed_model()
 COLLECTION = load_vectordb()
 # Serialize GPU embedding + Chroma access; the research UI is low-QPS and this

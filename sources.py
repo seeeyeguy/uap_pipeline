@@ -572,6 +572,120 @@ GH_MIRRORS = Source(
 )
 
 
+ITALY_AMI = Source(
+    id="italy_ami",
+    name="Italy — Aeronautica Militare OVNI archive",
+    org="Aeronautica Militare (General Security Dept., Air Force Staff)",
+    homepage="https://www.aeronautica.difesa.it/en/ovni/",
+    category=INTL_GOV,
+    description=(
+        "Official Italian Air Force UFO sighting archive, 1972-present: yearly "
+        "PDFs 2001+ plus grouped 1972-1990 and 1991-2000 archives (~31 files, "
+        "still updated monthly). Direct downloads, no auth."
+    ),
+    access="scrape",
+    scraper="italy_ami",
+)
+
+CHILE_SEFAA = Source(
+    id="chile_sefaa",
+    name="Chile — SEFAA/DGAC resolved case files",
+    org="SEFAA (DGAC, successor to CEFAA)",
+    homepage="https://sefaa.dgac.gob.cl/",
+    category=INTL_GOV,
+    description=(
+        "Official Chilean anomalous-aerial-phenomena unit: ~1,680 resolved-case "
+        "PDFs (2018-present) enumerable via the open WordPress REST API "
+        "(wp-json/wp/v2/media). Enumerate via API, never guess upload paths."
+    ),
+    access="scrape",
+    scraper="chile_sefaa",
+)
+
+DENMARK_UFO = Source(
+    id="denmark_ufo",
+    name="Denmark — Flyvevåbnet UFO archive (released 2009)",
+    org="Forsvaret / Flyvertaktisk Kommando",
+    homepage="https://www.forsvaret.dk/da/organisation/flyvevaabnet/flyvevabnets-historie/flyvevabnets-ufo-arkiv--offentliggjort-i-2009/",
+    category=INTL_GOV,
+    description="Danish Air Force operations-center UFO inquiries ~1978-2002, 4 PDFs / ~329 pages.",
+    access="direct",
+    static_resources=[
+        resource("denmark_ufo", f"Flyvevåbnet UFO archive part {i+1}",
+                 f"https://www.forsvaret.dk{p}", "pdf", INTL_GOV,
+                 requires_ocr=True, verified=True)
+        for i, p in enumerate([
+            "/globalassets/fko---flyvevabnet/flk/dokumenter/ufo-arkiv/-flv_ufo_materiale_side1-99-.pdf",
+            "/globalassets/fko---flyvevabnet/flk/dokumenter/ufo-arkiv/-flv_ufo_materiale_side100-199-.pdf",
+            "/globalassets/fko---flyvevabnet/flk/dokumenter/ufo-arkiv/-flv_ufo_materiale_side200-280-.pdf",
+            "/globalassets/fko---flyvevabnet/flk/dokumenter/ufo-arkiv/-flv_ufo_materiale_side280-329-.pdf",
+        ])
+    ],
+)
+
+CIA_IA_MIRROR = Source(
+    id="cia_ia_mirror",
+    name="CIA reading-room mirror (Internet Archive item CIAUFO)",
+    org="archive.org / Michael Best (That 1 Archive)",
+    homepage="https://archive.org/details/CIAUFO",
+    category=COMMUNITY,
+    description=(
+        "Mirror of 648 CIA UFO reading-room PDFs (~4.13 GB) — bypasses the "
+        "Akamai-blocked cia.gov reading room. Note: distinct from the "
+        "CIAUFOCD CD-ROM set already held via blackvault."
+    ),
+    access="scrape",
+    scraper="cia_ia_mirror",
+)
+
+UPDB = Source(
+    id="updb",
+    name="UPDB — Unified Phenomenon Database (consolidated sightings)",
+    org="updb.app / phenomenAInon",
+    homepage="https://updb.app/download",
+    category=DATASET,
+    description=(
+        "Consolidated SQL database of 300k+ sighting reports WITH narratives, "
+        "absorbing NUFORC (~138k), MUFON, UFOCAT and NICAP into one normalized "
+        "schema. Adopted as THE sightings layer of the corpus — the standalone "
+        "NUFORC CSVs are retired at the next index rebuild to avoid duplicate "
+        "sightings. Site is intermittently offline; failed downloads retry on "
+        "later runs via the ledger."
+    ),
+    access="direct",
+    static_resources=[
+        resource("updb", "phenomenon.sql.gz — sighting reports dump",
+                 "https://updb.app/phenomenon.sql.gz",
+                 "sql.gz", DATASET, requires_ocr=False),
+        resource("updb", "phenomenon_docs.sql.gz — related documents dump",
+                 "https://updb.app/phenomenon_docs.sql.gz",
+                 "sql.gz", DATASET, requires_ocr=False),
+    ],
+)
+
+UFOSINT = Source(
+    id="ufosint_flags",
+    name="UFOSINT — deduplicated unified sightings DB (dedup flags + quality scores)",
+    org="UFOSINT (github.com/UFOSINT)",
+    homepage="https://github.com/UFOSINT/ufosint-explorer",
+    category=DATASET,
+    description=(
+        "SQLite snapshot of 618k sightings merged from six databases with a "
+        "three-tier dedup engine (126,729 flagged duplicate pairs), geocode "
+        "verification and quality scores. Narratives are STRIPPED in this "
+        "export — used as the dedup/quality spine when importing UPDB rows, "
+        "not as a narrative source. Pin the release tag when updating."
+    ),
+    access="direct",
+    static_resources=[
+        resource("ufosint_flags", "ufo_public.db (SQLite, v0.14.0, 659MB)",
+                 "https://github.com/UFOSINT/ufosint-explorer/releases/download/v0.14.0/ufo_public.db",
+                 "sqlite", DATASET, requires_ocr=False, verified=True,
+                 size_hint="659MB"),
+    ],
+)
+
+
 # ─────────────────────────────────────────────
 # REGISTRY
 # ─────────────────────────────────────────────
@@ -581,10 +695,11 @@ SOURCES: list[Source] = [
     WARGOV, NARA, CIA, FBI, NSA, AARO, ODNI, DODIG, NAVY,
     # International government
     GEIPAN, UK, CANADA, AUSTRALIA, BRAZIL, NZ,
+    ITALY_AMI, CHILE_SEFAA, DENMARK_UFO, CIA_IA_MIRROR,
     # Community archives
     BLACKVAULT, IA, NICAP, AFU, MAJESTIC, BBARCHIVE,
     # Datasets
-    NUFORC, RICHGEL,
+    NUFORC, RICHGEL, UPDB, UFOSINT,
     # Mirrors
     GH_MIRRORS,
 ]

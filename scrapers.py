@@ -18,7 +18,7 @@ import logging
 import re
 import time
 from typing import Optional
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse, unquote, parse_qs, quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -156,6 +156,41 @@ def scrape_wargov(session, opts) -> list[dict]:
             out.append(resource("wargov_pursue", _title_from_url(url), url,
                                 _kind_from_url(url), US_GOV, verified=True,
                                 notes="Linked from war.gov/ufo/ (incl. release bundles)"))
+
+    # Strategy 4 — pursueufotracker's Cloudflare R2 mirror. war.gov's file
+    # CDN went bot-gated (403 to everything) in July 2026; the tracker
+    # mirrors every indexed file. Each detail page carries both the original
+    # war.gov URL (for the true filename, via save_as) and the R2 asset.
+    known = {u.rsplit("/", 1)[-1] for u in (r["url"] for r in out)}
+    r = _get(session, "https://pursueufotracker.com/generated/api/files.json")
+    if r is not None:
+        try:
+            entries = r.json()
+            entries = entries.get("files", entries) if isinstance(entries, dict) else entries
+        except ValueError:
+            entries = []
+        added = 0
+        for e in entries:
+            detail = e.get("url", "")
+            if not detail:
+                continue
+            page = _get(session, detail)
+            if page is None:
+                continue
+            m_war = re.search(r'href="(https://www\.war\.gov/medialink/[^"]+)"', page.text)
+            m_r2 = re.search(r'href="(https://pub-[a-z0-9]+\.r2\.dev/[^"]+)"', page.text)
+            if not m_r2:
+                continue
+            orig_name = m_war.group(1).rsplit("/", 1)[-1] if m_war else None
+            if orig_name and orig_name in known:
+                continue  # already have it under its war.gov URL
+            out.append({**resource(
+                "wargov_pursue", e.get("title") or e["id"], m_r2.group(1),
+                _kind_from_url(m_r2.group(1)), US_GOV, verified=True,
+                notes=f"R2 mirror of {m_war.group(1) if m_war else 'unknown war.gov file'}"),
+                "save_as": orig_name})
+            added += 1
+        log.info(f"war.gov: +{added} files via pursueufotracker R2 mirror")
     return out
 
 
@@ -466,8 +501,17 @@ def scrape_internet_archive(session, opts) -> list[dict]:
                                r.json()["response"]["docs"]]
                 except (ValueError, KeyError):
                     pass
-            log.info(f"archive.org collection {identifier}: {len(members)} items")
-            for m in members:
+            cap = opts.get("ia_max_items", 500)
+            if len(members) > cap:
+                log.info(f"archive.org collection {identifier}: {len(members)} items "
+                         f"— capping enumeration at {cap} (each item is one "
+                         f"metadata request; raise --ia-max-items to go deeper)")
+                members = members[:cap]
+            else:
+                log.info(f"archive.org collection {identifier}: {len(members)} items")
+            for i, m in enumerate(members, 1):
+                if i % 50 == 0:
+                    log.info(f"  {identifier}: {i}/{len(members)} items enumerated")
                 out += _ia_item_files(session, m, f"{title} / {m}")
         else:
             out += _ia_item_files(session, identifier, title)
@@ -537,7 +581,20 @@ def scrape_afu(session, opts) -> list[dict]:
             continue
         for a in soup.find_all("a", href=True):
             href = urljoin(url, a["href"])
-            if not href.startswith(root) or "?" in href:
+            if not href.startswith(root):
+                continue
+            query = urlparse(href).query
+            if query:
+                # files.afu.se is a PHP file browser: subdirectories are
+                # "?dir=<path>" links (sort links carry "order="; "?dir=./"
+                # is the self-link). Depth = path depth of the dir param.
+                params = parse_qs(query)
+                d = (params.get("dir") or [""])[0].strip("/")
+                if d and d != "." and "order" not in params:
+                    d_depth = d.count("/") + 1
+                    norm = f"{root}?dir={quote(d)}"
+                    if d_depth <= max_depth and norm not in visited:
+                        to_visit.append((norm, d_depth))
                 continue
             if href.endswith("/") and depth < max_depth:
                 to_visit.append((href, depth + 1))
@@ -587,11 +644,85 @@ def scrape_github_datasets(session, opts) -> list[dict]:
     return out
 
 
+def scrape_italy_ami(session, opts) -> list[dict]:
+    """Italian Air Force OVNI archive: ~31 direct PDF links on one page.
+
+    The site serves an incomplete TLS chain that Python's CA bundle rejects
+    (curl/browsers cope via AIA chasing) — verify=False is deliberate for
+    this public-document host. The site also rate-limits aggressive
+    fetching; the downloader's per-host delay handles that.
+    """
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    out, seen = [], set()
+    r = _get(session, "https://www.aeronautica.difesa.it/en/ovni/", verify=False)
+    if r is None:
+        return out
+    for m in re.finditer(r'href="([^"]+\.pdf)"', r.text, re.I):
+        url = m.group(1)
+        if url.startswith("/"):
+            url = "https://www.aeronautica.difesa.it" + url
+        if url in seen or "aeronautica.difesa.it" not in url:
+            continue
+        seen.add(url)
+        out.append(resource("italy_ami", f"Italy AMI OVNI: {_title_from_url(url)}",
+                            url, "pdf", INTL_GOV, verified=True))
+    log.info(f"italy_ami: {len(out)} PDFs")
+    return out
+
+
+def scrape_chile_sefaa(session, opts) -> list[dict]:
+    """Chile SEFAA case files via the open WordPress REST media API."""
+    out = []
+    page = 1
+    while True:
+        r = _get(session,
+                 "https://sefaa.dgac.gob.cl/wp-json/wp/v2/media"
+                 f"?media_type=application&per_page=100&page={page}")
+        if r is None or r.status_code != 200:
+            break
+        try:
+            items = r.json()
+        except ValueError:
+            break
+        if not items:
+            break
+        for it in items:
+            url = it.get("source_url", "")
+            if not url.lower().endswith(".pdf"):
+                continue
+            title = (it.get("title") or {}).get("rendered") or _title_from_url(url)
+            out.append(resource("chile_sefaa", f"Chile SEFAA: {title}",
+                                url, "pdf", INTL_GOV, verified=True))
+        if len(items) < 100:
+            break
+        page += 1
+    log.info(f"chile_sefaa: {len(out)} case PDFs across {page} API page(s)")
+    return out
+
+
+def scrape_cia_ia_mirror(session, opts) -> list[dict]:
+    """CIA reading-room mirror: files of archive.org item CIAUFO."""
+    out = _ia_item_files(session, "CIAUFO", "CIA UFO reading-room mirror")
+    for res in out:
+        res["source"] = "cia_ia_mirror"
+    # source PDFs only: IA's .txt/_text.pdf/djvu derivatives would enter the
+    # corpus as text-native duplicates of documents we OCR ourselves
+    out = [res for res in out
+           if res["url"].lower().endswith(".pdf")
+           and not res["url"].lower().endswith("_text.pdf")]
+    log.info(f"cia_ia_mirror: {len(out)} source PDFs")
+    return out
+
+
 # ─────────────────────────────────────────────
 # REGISTRY
 # ─────────────────────────────────────────────
 
 SCRAPERS = {
+    "italy_ami":         scrape_italy_ami,
+    "chile_sefaa":       scrape_chile_sefaa,
+    "cia_ia_mirror":     scrape_cia_ia_mirror,
     "wargov_pursue":     scrape_wargov,
     "nara_uap_bulk":     scrape_nara,
     "cia_readingroom":   scrape_cia,

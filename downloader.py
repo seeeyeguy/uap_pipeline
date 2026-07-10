@@ -144,8 +144,14 @@ def _size_hint_bytes(size_hint) -> int:
 
 def download_all(manifest: dict, only_sources: list[str] = None,
                  include_kinds: set = None, include_videos: bool = False,
-                 max_size_gb: float = None, force: bool = False) -> dict:
-    """Download every manifest resource that passes the filters."""
+                 max_size_gb: float = None, force: bool = False,
+                 total_gb: float = None) -> dict:
+    """Download every manifest resource that passes the filters.
+
+    max_size_gb filters individual resources by size hint; total_gb is a
+    cumulative budget across the whole run — once newly-downloaded bytes
+    exceed it, the run stops (already-downloaded files are never counted).
+    """
     ledger = load_ledger()
     session = requests.Session()
     # Match scrapers.py: some gov WAFs (war.gov) 403 non-browser agents even
@@ -177,12 +183,23 @@ def download_all(manifest: dict, only_sources: list[str] = None,
              f"({len(ledger['completed'])} already complete).")
 
     stats = {"ok": 0, "failed": 0}
+    budget = int(total_gb * (1 << 30)) if total_gb else None
+    new_bytes = 0
     for r in tqdm(todo, desc="Downloading", unit="file"):
+        if budget is not None and new_bytes >= budget:
+            log.info(f"Total download budget reached "
+                     f"({new_bytes / (1 << 30):.2f} GB >= {total_gb} GB) — "
+                     f"stopping; {len(todo) - stats['ok'] - stats['failed']} "
+                     f"resources left for a future run.")
+            break
         source_dir = Path(DOWNLOAD_DIR) / r["source"]
         if r["kind"] == "git":
             result = _clone_repo(r["url"], source_dir)
         else:
-            dest = source_dir / _safe_filename(r["url"])
+            # save_as: mirrors (e.g. the PURSUE R2 bucket) serve files under
+            # slug URLs; honoring an explicit name keeps the ORIGINAL filename
+            # so mirror fetches line up with files already on disk.
+            dest = source_dir / (r.get("save_as") or _safe_filename(r["url"]))
             # Some URLs carry no usable extension (e.g. FBI Vault's
             # .../at_download/file). Without one, ingest_tree's suffix filter
             # silently skips the file. Derive it from the manifest kind.
@@ -195,6 +212,14 @@ def download_all(manifest: dict, only_sources: list[str] = None,
             want = KIND_EXT.get(r.get("kind"))
             if want and dest.suffix.lower() not in KNOWN:
                 dest = dest.with_name(dest.name + want)
+            if dest.exists() and dest.stat().st_size > 0:
+                # same document fetched earlier under another URL (e.g. the
+                # original war.gov link before the mirror) — don't re-download
+                log.info(f"Already on disk, skipping: {dest.name}")
+                ledger["completed"][r["url"]] = {"path": str(dest),
+                                                 "note": "pre-existing file"}
+                stats["ok"] += 1
+                continue
             result = _download_file(session, r["url"], dest,
                                     expected_sha256=r.get("sha256"))
             if result.get("ok"):
@@ -202,6 +227,7 @@ def download_all(manifest: dict, only_sources: list[str] = None,
 
         if result.get("ok"):
             stats["ok"] += 1
+            new_bytes += result.get("bytes") or 0
             ledger["completed"][r["url"]] = {
                 "path": result.get("path"),
                 "sha256": result.get("sha256"),
