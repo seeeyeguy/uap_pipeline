@@ -56,8 +56,13 @@ EMBED_MODEL_ID  = "BAAI/bge-m3"
 LLM_MODEL       = "claude-sonnet-4-6"
 COLLECTION_NAME = "uap_documents"
 
-CHUNK_SIZE     = 512
-CHUNK_OVERLAP  = 64
+# Chunking (2026-07 rebuild): pages are the primary unit for OCR'd docs.
+# CHUNK_SIZE/OVERLAP (in CHARACTERS) apply to unmarked text and to
+# subdividing oversized single pages.
+CHUNK_SIZE        = 2000
+CHUNK_OVERLAP     = 200
+PAGE_CHUNK_TARGET = 2500   # pack consecutive pages up to this many chars
+PAGE_CHUNK_MAX    = 3000   # single pages above this get subdivided
 MAX_NEW_TOKENS = 8192
 
 # PDFs whose embedded text layer averages at least this many characters
@@ -905,11 +910,69 @@ def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -
 # STEP 4 — CHUNK
 # ─────────────────────────────────────────────
 
+PAGE_MARKER = re.compile(r"^--- Page (\d+) ---$", re.M)
+
+
+def _page_aligned_splits(text: str, splitter) -> list[tuple[str, str]]:
+    """
+    Split OCR text on its page markers, then pack pages into chunks:
+      - merge consecutive pages up to PAGE_CHUNK_TARGET chars
+        (a record card is one page; a memo is 2-3 — pages are the natural
+        semantic unit of scanned government documents)
+      - subdivide any single page over PAGE_CHUNK_MAX with the recursive
+        splitter so dense book pages don't produce diluted mega-chunks
+    Returns (chunk_text, page_span) pairs, e.g. ("...", "3-5").
+    """
+    parts = PAGE_MARKER.split(text)
+    # parts = [preamble, pageno, body, pageno, body, ...]
+    pages = []
+    if parts[0].strip():
+        pages.append(("1", parts[0].strip()))
+    for pageno, body in zip(parts[1::2], parts[2::2]):
+        if body.strip():
+            pages.append((pageno, body.strip()))
+    if not pages:
+        return []
+
+    out = []
+    buf, buf_start, buf_end = "", None, None
+    for pageno, body in pages:
+        if len(body) > PAGE_CHUNK_MAX:
+            if buf:
+                out.append((buf, _span(buf_start, buf_end)))
+                buf, buf_start = "", None
+            for piece in splitter.split_text(body):
+                out.append((piece, pageno))
+            continue
+        if buf and len(buf) + len(body) > PAGE_CHUNK_TARGET:
+            out.append((buf, _span(buf_start, buf_end)))
+            buf, buf_start = "", None
+        buf = f"{buf}\n\n{body}" if buf else body
+        buf_start = buf_start or pageno
+        buf_end = pageno
+    if buf:
+        out.append((buf, _span(buf_start, buf_end)))
+    return out
+
+
+def _span(a, b):
+    return a if a == b else f"{a}-{b}"
+
+
 def chunk_documents(docs: list[dict]) -> list[dict]:
     """
     Chunk the raw document text. All enriched metadata is attached to every
     chunk so filtering works at query time without needing a separate
     metadata store.
+
+    Chunking policy (2026-07 rebuild):
+      - text-native pseudo-docs (CSV/JSON rows, sightings): one chunk per
+        record — never page-split structured data
+      - OCR'd documents: page-aligned packing (see _page_aligned_splits)
+      - anything without page markers: recursive split at CHUNK_SIZE
+      - every chunk carries `pages` + parent identifiers (filename/source)
+        so the serving layer can do small-to-big retrieval: match on the
+        chunk, hand the LLM the surrounding page span from data/text
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -926,25 +989,36 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
             log.warning(f"Empty text for {doc['filename']}, skipping.")
             continue
 
-        splits = splitter.split_text(text_to_chunk)
+        if doc.get("text_native"):
+            # structured rows are already one semantic unit each
+            splits = [(text_to_chunk, "")] if len(text_to_chunk) <= PAGE_CHUNK_MAX \
+                else [(s, "") for s in splitter.split_text(text_to_chunk)]
+        elif PAGE_MARKER.search(text_to_chunk):
+            splits = _page_aligned_splits(text_to_chunk, splitter)
+        else:
+            splits = [(s, "") for s in splitter.split_text(text_to_chunk)]
+
         # English enrichment summary as an auxiliary chunk (chunk_id -1):
         # gives every document — especially non-English ones — an English
         # semantic entry point in the index, on top of bge-m3's native
         # cross-lingual matching.
         summary = (doc.get("summary") or "").strip()
         if summary:
-            splits = [summary] + splits
-        for i, split in enumerate(splits, start=(-1 if summary else 0)):
+            splits = [(summary, "summary")] + splits
+        for i, (split, pages) in enumerate(splits, start=(-1 if summary else 0)):
             chunks.append({
                 "text":                 split,
                 "source":               doc["source"],
                 "filename":             doc["filename"],
                 "chunk_id":             i,
+                "pages":                pages,
                 # Enriched fields — all stringified for ChromaDB compatibility
                 "summary":              doc.get("summary", ""),
                 "document_type":        doc.get("document_type", "unknown"),
                 "event_date":           doc.get("event_date") or "",
                 "country":              (doc.get("event_location") or {}).get("country") or "",
+                "region":               (doc.get("event_location") or {}).get("region") or "",
+                "city":                 (doc.get("event_location") or {}).get("city") or "",
                 "time_period":          doc.get("time_period", "unknown"),
                 "classification_level": doc.get("classification_level", "unknown"),
                 "ocr_quality":          doc.get("ocr_quality", "unknown"),

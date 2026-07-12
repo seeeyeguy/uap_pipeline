@@ -24,7 +24,7 @@ from pathlib import Path
 
 ROOT        = Path(__file__).parent
 POD_HOST    = "root@209.170.80.132"
-PODS        = {"1": "13976", "2": "10045", "3": "10106", "4": "13925", "5": "14092", "6": "10960"}   # name -> ssh port (shared volume)
+PODS        = {"1": "13976", "2": "10045", "3": "10106", "4": "13925", "5": "14092", "6": "10960", "7": "20513", "8": "10191", "9": "20609", "10": "11187"}   # name -> ssh port (shared volume)
 
 
 def ssh_cmd(port):
@@ -168,6 +168,60 @@ def log_poller():
         except Exception:
             pass
         time.sleep(LOGPOLL_S)
+
+
+def enrich_poller():
+    """Track enrichment v2: batch statuses (API), cached results + OCR-quality
+    histogram (local, incremental reads so each poll only parses new files)."""
+    seen = set()
+    quality = {}
+    client = None
+    try:
+        import anthropic
+        key = re.search(r"^ANTHROPIC_API_KEY=(.+)$",
+                        open("/apps/uap-api/.env").read(), re.M).group(1).strip()
+        client = anthropic.Anthropic(api_key=key)
+    except Exception:
+        pass
+    while True:
+        try:
+            e = {"active": False}
+            state_f = ROOT / "data/enrich_v2_state.json"
+            out_dir = ROOT / "data/enriched_v2"
+            if state_f.exists():
+                st = json.loads(state_f.read_text())
+                e["active"] = True
+                e["submitted"] = len(st.get("submitted", {}))
+                e["failed"] = len(st.get("failed", {}))
+                if out_dir.exists():
+                    for p in out_dir.glob("*.json"):
+                        if p.name in seen:
+                            continue
+                        seen.add(p.name)
+                        try:
+                            q = json.loads(p.read_text()).get("ocr_quality") or "unknown"
+                        except Exception:
+                            q = "unparseable"
+                        quality[q] = quality.get(q, 0) + 1
+                e["cached"] = len(seen)
+                e["quality"] = dict(quality)
+                batches = []
+                if client:
+                    for bid in st.get("batches", [])[-15:]:
+                        try:
+                            b = client.messages.batches.retrieve(bid)
+                            rc = b.request_counts
+                            batches.append({
+                                "id": bid[-8:], "status": b.processing_status,
+                                "processing": rc.processing, "succeeded": rc.succeeded,
+                                "errored": rc.errored})
+                        except Exception:
+                            batches.append({"id": bid[-8:], "status": "?"})
+                e["batches"] = batches
+            STATE["enrich"] = e
+        except Exception:
+            pass
+        time.sleep(60)
 
 
 _H = {"done": None, "fails": 0, "workers": None, "stall_since": None,
@@ -376,6 +430,28 @@ async function tick(){
     ${podRows}
     <tr><td>total workers</td><td class="${pod.workers>=3?'ok':'bad'}">${pod.workers??0} running</td></tr>
     <tr><td>pod reachable</td><td class="${pod.reachable?'ok':'bad'}">${pod.reachable}</td></tr></table></div>`;
+  const en = s.enrich||{};
+  if (en.active) {
+    const q = en.quality||{};
+    const order = ['good','degraded','garbage','unknown','unparseable'];
+    const colors = {good:'#5fd38d',degraded:'#e5b567',garbage:'#e46a6a',unknown:'#67788c',unparseable:'#a06adf'};
+    const qtot = Object.values(q).reduce((a,b)=>a+b,0)||1;
+    const qbars = order.filter(k=>q[k]).map(k=>
+      `<div style="margin:.15rem 0"><span class="dim" style="display:inline-block;width:7.5em">${k}</span>
+       <div class="bar" style="display:inline-block;width:50%;vertical-align:middle">
+         <div class="fill" style="width:${(100*q[k]/qtot).toFixed(1)}%;background:${colors[k]}"></div></div>
+       ${q[k]} (${(100*q[k]/qtot).toFixed(1)}%)</div>`).join('');
+    html += `<div class="card"><h2>Enrichment v2 (Haiku, pass 1)</h2>
+      <div class="big">${en.cached??0} / ${en.submitted??0}</div>
+      ${bar(100*(en.cached||0)/((en.submitted||1)))}
+      <div class="dim">${en.failed||0} failed (auto-retry) · OCR quality of enriched docs:</div>
+      ${qbars||'<div class="dim">no results yet</div>'}</div>`;
+    const brows = (en.batches||[]).map(b=>
+      `<tr><td>…${b.id}</td><td class="${b.status==='ended'?'ok':'warn'}">${b.status}</td>
+       <td>${b.succeeded??''}✓ ${b.processing??''}⋯ ${b.errored??''}✗</td></tr>`).join('');
+    html += `<div class="card"><h2>Enrichment batches (in flight)</h2>
+      <table>${brows||'<tr><td>none</td></tr>'}</table></div>`;
+  }
   const hc = Object.entries((s.health||{}).checks||{}).map(([k,v])=>
     `<tr><td>${k}</td><td class="${v.status==='ok'?'ok':(v.status==='warn'?'warn':'bad')}">${v.status}</td><td class="dim">${v.detail}</td></tr>`).join('');
   html += `<div class="card"><h2>Health monitor</h2><table>${hc||'<tr><td>waiting for first poll…</td></tr>'}</table></div>`;
@@ -408,6 +484,7 @@ class Handler(BaseHTTPRequestHandler):
                 "updated": STATE["updated"], "pod": pod, "local": STATE.get("local", {}),
                 "workers": STATE.get("workers", {}),
                 "health": STATE.get("health", {}),
+                "enrich": STATE.get("enrich", {}),
                 "total_docs": TOTAL_DOCS, "total_pages": TOTAL_PAGES,
                 "done_pages": pod.get("done_pages"),
                 "rates": compute_rates(), "poll_s": POLL_S,
@@ -438,6 +515,7 @@ def main():
     TOTAL_PAGES = sum(PAGES.get(Path(f).stem, 12) for f in full) + 15 * len(sample)
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=log_poller, daemon=True).start()
+    threading.Thread(target=enrich_poller, daemon=True).start()
     print(f"dashboard on http://0.0.0.0:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
