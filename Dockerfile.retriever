@@ -24,7 +24,7 @@ RUN python -c "from huggingface_hub import snapshot_download; \
     snapshot_download('BAAI/bge-m3', ignore_patterns=['onnx/*', '*.onnx', 'imgs/*'])"
 
 WORKDIR /app
-COPY main.py retriever.py ./
+COPY main.py retriever.py textqc.py ./
 
 # 0.0.0.0 so the port is reachable from outside the container; compose
 # publishes it on localhost only. VECTORDB_DIR matches the compose mount.

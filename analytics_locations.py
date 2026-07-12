@@ -148,17 +148,25 @@ def best(cands):
 
 
 def resolve(city, region, country):
-    """-> (geoname_id, cc, adm1_code, match_level)"""
+    """-> (geoname_id, cc, adm1_code, match_level)
+
+    A RESOLVED region is authoritative: when (cc, adm1, city) misses, stay
+    at region level rather than matching the city country-wide — the
+    population tie-break would otherwise relocate e.g. Farmington/Wisconsin
+    to Farmington/New Mexico. Country-wide and global city tiers apply only
+    when no narrower scope resolved.
+    """
     cc = resolve_country(country, region)
     adm1 = resolve_region(cc, region)
     c = clean_city(city)
     if c:
-        if cc and adm1 and (cc, adm1, c) in IDX3:
-            return best(IDX3[(cc, adm1, c)]), cc, adm1, "city_exact"
-        if cc and (cc, c) in IDX2:
+        if cc and adm1:
+            if (cc, adm1, c) in IDX3:
+                return best(IDX3[(cc, adm1, c)]), cc, adm1, "city_exact"
+        elif cc and (cc, c) in IDX2:
             gid = best(IDX2[(cc, c)])
             return gid, cc, CITY[gid][1], "city_cc"
-        if not cc and c in IDX1:
+        elif not cc and c in IDX1:
             gid = best(IDX1[c])
             return gid, CITY[gid][2], CITY[gid][1], "city_global"
     if adm1:
@@ -184,6 +192,10 @@ ldf = pd.DataFrame(
 con.register("_loc", ldf)
 con.execute("INSERT INTO locations SELECT * FROM _loc")
 con.unregister("_loc")
+
+# re-runs must not keep coordinates a previous (possibly wrong) city match
+# assigned — only source-provided coordinates survive the reset
+con.execute("UPDATE events SET lat=NULL, lng=NULL WHERE geo_src='geonames'")
 
 # ── resolve every distinct raw (city, region, country) ──
 tuples = con.execute(

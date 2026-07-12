@@ -28,6 +28,8 @@ from pdf2image import convert_from_path
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from textqc import chunk_junk_reason
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
@@ -997,6 +999,10 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
             splits = _page_aligned_splits(text_to_chunk, splitter)
         else:
             splits = [(s, "") for s in splitter.split_text(text_to_chunk)]
+
+        # drop degenerate chunks (OCR loops, alphabet-free table shred) —
+        # they embed near any short query and pollute retrieval
+        splits = [(s, p) for s, p in splits if not chunk_junk_reason(s)]
 
         # English enrichment summary as an auxiliary chunk (chunk_id -1):
         # gives every document — especially non-English ones — an English

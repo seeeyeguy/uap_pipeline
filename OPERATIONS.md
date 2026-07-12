@@ -162,6 +162,18 @@ GeoNames inputs live in `data/geonames/` (cities500, admin1, countryInfo).
 After publish, the retriever's `filters` accept the derived fields, e.g.
 `{"geo_cluster": 944}` or `{"loc_region": "New Mexico", "wave_cluster": "1960s:12"}`.
 
+**Serving store is Postgres/pgvector** (`corpus` schema in the uap-api DB,
+synced by `pg_publish.py`, which `pipeline.py publish` runs as its final
+step — `--no-pg` to skip). The retriever does HYBRID retrieval there:
+dense pgvector cosine + two tsvector arms (`simple` preserves exact tokens
+like callsigns — "LACY 17" — and case numbers; `english` adds stemming),
+fused with reciprocal-rank fusion. Chroma (`data/vectordb`) remains the
+build-side store the ingest pipeline writes; if `PG_DSN` is unset the
+retriever falls back to dense-only search on the mounted Chroma release.
+Chunk quality: `textqc.chunk_junk_reason` gates every chunk-producing path
+(degenerate OCR repetition / alphabet-free shred); `purge_junk_chunks.py`
+scans and cleans the build index retroactively.
+
 ---
 
 ## 9. Query examples

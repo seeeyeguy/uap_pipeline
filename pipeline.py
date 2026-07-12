@@ -238,6 +238,13 @@ def cmd_publish(args):
         log.info(f"Pruning old release: {d.name}")
         shutil.rmtree(d)
 
+    # 8. sync the serving Postgres (pgvector hybrid retrieval + analytics
+    #    tables). Atomic staging swap — the retriever needs no restart.
+    if not args.no_pg:
+        log.info("Syncing Postgres serving store (pg_publish.py)…")
+        subprocess.run([sys.executable, str(Path(__file__).parent / "pg_publish.py")],
+                       check=True)
+
 
 def cmd_inventory(args):
     """
@@ -485,6 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="how many releases to retain (default 3)")
     sp.add_argument("--no-restart", action="store_true",
                     help="update .env but don't recreate the retriever container")
+    sp.add_argument("--no-pg", action="store_true",
+                    help="skip the Postgres serving-store sync (pg_publish.py)")
     sp.set_defaults(fn=cmd_publish)
 
     sp = sub.add_parser("inventory",

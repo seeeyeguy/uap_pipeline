@@ -17,6 +17,7 @@ from pathlib import Path
 
 from main import _page_aligned_splits, PAGE_MARKER, PAGE_CHUNK_MAX, \
     RecursiveCharacterTextSplitter, CHUNK_SIZE, CHUNK_OVERLAP
+from textqc import chunk_junk_reason
 
 ROOT = Path(__file__).parent
 TEXT = ROOT / "data/text"
@@ -122,6 +123,8 @@ def main():
                 splits = _page_aligned_splits(text, splitter)
             else:
                 splits = [(s, "") for s in splitter.split_text(text)]
+            # drop degenerate chunks (OCR loops, alphabet-free table shred)
+            splits = [(b, p) for b, p in splits if not chunk_junk_reason(b)]
             summary = (e.get("summary") or "").strip()
             if summary:
                 splits = [(summary, "summary")] + splits

@@ -16,6 +16,9 @@ transformers>=4.44.0
 sentence-transformers>=3.0.0
 chromadb>=0.5.0
 
+# hybrid pg backend (pgvector + tsvector RRF); chroma stays the fallback
+psycopg[binary]>=3.1.0
+
 # imported at main.py top level even though the retriever never calls them
 anthropic>=0.28.0
 pdf2image>=1.17.0

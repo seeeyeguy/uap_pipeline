@@ -1,18 +1,18 @@
 # UAP Corpus Analytics
 
-_Generated 2026-07-12 13:39 UTC by analytics_stats.py — do not edit by hand._
+_Generated 2026-07-12 14:43 UTC by analytics_stats.py — do not edit by hand._
 
 - **713,916 events** across sources (UFOSINT structured, NUFORC narratives, enriched document corpus)
-- **585,330 geocoded** (82%) · **702,115 dated** (98%) · **504,347 resolved to a canonical GeoNames city** (71%)
-- **3,661 spatial hotspot clusters** covering 463,712 events · **7,579 decade-windowed wave clusters**
+- **579,824 geocoded** (81%) · **702,115 dated** (98%) · **487,690 resolved to a canonical GeoNames city** (68%)
+- **3,625 spatial hotspot clusters** covering 463,140 events · **7,513 decade-windowed wave clusters**
 
 ## Sources
 
 | source | events | geocoded | dated | city matched | earliest | latest |
 |---|---|---|---|---|---|---|
-| ufosint | 618,316 | 494,922 | 608,073 | 423,706 | 19 | 2925 |
-| nuforc | 80,332 | 80,331 | 79,638 | 70,564 | 1906 | 2014 |
-| corpus | 15,268 | 10,077 | 14,404 | 10,077 | 793 | 2026 |
+| ufosint | 618,316 | 489,815 | 608,073 | 409,925 | 19 | 2925 |
+| nuforc | 80,332 | 80,331 | 79,638 | 68,087 | 1906 | 2014 |
+| corpus | 15,268 | 9,678 | 14,404 | 9,678 | 793 | 2026 |
 
 ## Events per decade
 
@@ -96,64 +96,64 @@ _Generated 2026-07-12 13:39 UTC by analytics_stats.py — do not edit by hand._
 
 | state | events |
 |---|---|
-| California | 55,662 |
-| Florida | 26,480 |
-| Texas | 25,372 |
-| New York | 21,393 |
-| Ohio | 20,685 |
-| Washington | 18,995 |
-| Pennsylvania | 18,802 |
-| Illinois | 15,934 |
-| Arizona | 15,512 |
-| Michigan | 14,466 |
-| Colorado | 12,621 |
-| North Carolina | 11,400 |
-| Missouri | 11,091 |
-| Indiana | 11,010 |
-| Oregon | 10,679 |
+| California | 55,565 |
+| Florida | 26,305 |
+| Texas | 24,980 |
+| New York | 21,633 |
+| Ohio | 20,594 |
+| Washington | 19,303 |
+| Pennsylvania | 18,850 |
+| Illinois | 15,626 |
+| Arizona | 15,529 |
+| Michigan | 14,646 |
+| Colorado | 12,717 |
+| North Carolina | 11,341 |
+| Missouri | 11,235 |
+| Indiana | 11,036 |
+| Oregon | 10,866 |
 
 ## Top 20 spatial hotspots (all-time)
 
 | cluster | events | city | region | country | lat | lng | from | to |
 |---|---|---|---|---|---|---|---|---|
-| 944 | 1,854 | Phoenix | Arizona | United States | 33.45 | -112.07 | 1905 | 2026 |
-| 935 | 1,668 | Las Vegas | Nevada | United States | 36.17 | -115.14 | 1905 | 2026 |
-| 3644 | 1,555 | New York City | New York | United States | 40.71 | -74.01 | 1835 | 2026 |
-| 1506 | 1,529 | Los Angeles | California | United States | 34.05 | -118.24 | 1890 | 2026 |
-| 3251 | 1,278 | Chicago | Illinois | United States | 41.85 | -87.65 | 600 | 2026 |
-| 3081 | 1,234 | Dayton | Ohio | United States | 39.76 | -84.19 | 1918 | 2025 |
-| 1192 | 1,227 | Portland | Oregon | United States | 45.52 | -122.68 | 1905 | 2026 |
-| 898 | 1,209 | Tucson | Arizona | United States | 32.22 | -110.93 | 1917 | 2026 |
-| 1450 | 1,207 | Seattle | Washington | United States | 47.61 | -122.33 | 1946 | 2026 |
-| 1763 | 1,164 | Houston | Texas | United States | 29.76 | -95.36 | 1890 | 2026 |
-| 1351 | 1,078 | San Diego | California | United States | 32.72 | -117.16 | 1943 | 2026 |
-| 962 | 1,057 | Albuquerque | New Mexico | United States | 35.08 | -106.65 | 1900 | 2026 |
-| 2414 | 980 | Columbus | Ohio | United States | 39.96 | -83.0 | 196 | 2025 |
-| 1087 | 977 | Denver | Colorado | United States | 39.74 | -104.98 | 1947 | 2026 |
-| 1886 | 952 | San Antonio | Texas | United States | 29.42 | -98.49 | 1000 | 2026 |
-| 3375 | 944 | Washington | District of Columbia | United States | 38.9 | -77.04 | 1850 | 2025 |
-| 1895 | 896 | Austin | Texas | United States | 30.27 | -97.74 | 1897 | 2026 |
-| 2517 | 887 | London | England | United Kingdom | 51.51 | -0.13 | 1123 | 2026 |
-| 860 | 883 | Miami | Florida | United States | 25.77 | -80.19 | 1890 | 2026 |
-| 2566 | 873 | Kansas City | Missouri | United States | 39.1 | -94.58 | 1897 | 2026 |
+| 1199 | 1,854 | Phoenix | Arizona | United States | 33.45 | -112.07 | 1905 | 2026 |
+| 674 | 1,667 | Las Vegas | Nevada | United States | 36.17 | -115.14 | 1905 | 2026 |
+| 3601 | 1,555 | New York City | New York | United States | 40.71 | -74.01 | 1835 | 2026 |
+| 1361 | 1,529 | Los Angeles | California | United States | 34.05 | -118.24 | 1890 | 2026 |
+| 3225 | 1,278 | Chicago | Illinois | United States | 41.85 | -87.65 | 600 | 2026 |
+| 3115 | 1,234 | Dayton | Ohio | United States | 39.76 | -84.19 | 1918 | 2025 |
+| 1073 | 1,230 | Portland | Oregon | United States | 45.52 | -122.68 | 1905 | 2026 |
+| 1005 | 1,209 | Tucson | Arizona | United States | 32.22 | -110.93 | 1917 | 2026 |
+| 1332 | 1,207 | Seattle | Washington | United States | 47.61 | -122.33 | 1946 | 2026 |
+| 1756 | 1,164 | Houston | Texas | United States | 29.76 | -95.36 | 1890 | 2026 |
+| 783 | 1,073 | San Diego | California | United States | 32.72 | -117.16 | 1943 | 2026 |
+| 1376 | 1,058 | Albuquerque | New Mexico | United States | 35.08 | -106.65 | 1900 | 2026 |
+| 2850 | 980 | Columbus | Ohio | United States | 39.96 | -83.0 | 196 | 2025 |
+| 1416 | 977 | Denver | Colorado | United States | 39.74 | -104.98 | 1947 | 2026 |
+| 2023 | 954 | San Antonio | Texas | United States | 29.42 | -98.49 | 1000 | 2026 |
+| 3350 | 940 | Washington | District of Columbia | United States | 38.9 | -77.04 | 1850 | 2025 |
+| 2016 | 899 | Austin | Texas | United States | 30.27 | -97.74 | 1897 | 2026 |
+| 2516 | 887 | London | England | United Kingdom | 51.51 | -0.13 | 1123 | 2026 |
+| 1818 | 883 | Miami | Florida | United States | 25.77 | -80.19 | 1890 | 2026 |
+| 2485 | 873 | Kansas City | Missouri | United States | 39.1 | -94.58 | 1897 | 2026 |
 
 ## Largest wave concentrations per decade
 
 | wave | events | city | region | country |
 |---|---|---|---|---|
-| 1900s:5 | 118 | Peterborough | England | United Kingdom |
-| 1910s:2 | 148 | Hamburg | England | United Kingdom |
-| 1920s:2 | 167 | Hubbell | Michigan | United States |
-| 1930s:1 | 145 | Boden | Norrbotten | Sweden |
+| 1900s:7 | 115 | Peterborough | England | United Kingdom |
+| 1910s:0 | 149 | Hamburg | England | United Kingdom |
+| 1920s:3 | 157 | Ferme-Neuve | Nebraska | United States |
+| 1930s:1 | 144 | Boden | Norrbotten | Sweden |
 | 1940s:146 | 199 | Chicago | Illinois | United States |
-| 1950s:824 | 336 | Washington | District of Columbia | United States |
+| 1950s:826 | 334 | Washington | District of Columbia | United States |
 | 1960s:821 | 593 | Dayton | Ohio | United States |
-| 1970s:67 | 330 | Colares | Pará | Brazil |
-| 1980s:209 | 324 | Madbury | Massachusetts | United States |
-| 1990s:265 | 251 | Paris | Île-de-France | France |
-| 2000s:445 | 501 | Phoenix | Arizona | United States |
-| 2010s:316 | 700 | Phoenix | Arizona | United States |
-| 2020s:75 | 331 | Las Vegas | Nevada | United States |
+| 1970s:60 | 330 | Colares | Pará | Brazil |
+| 1980s:208 | 323 | Madbury | Massachusetts | United States |
+| 1990s:276 | 251 | Paris | Île-de-France | France |
+| 2000s:330 | 501 | Phoenix | Arizona | United States |
+| 2010s:329 | 700 | Phoenix | Arizona | United States |
+| 2020s:88 | 333 | Las Vegas | Nevada | United States |
 
 ## Quality
 
