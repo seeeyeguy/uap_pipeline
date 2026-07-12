@@ -140,7 +140,31 @@ Code map: `pipeline.py` (CLI) · `sources.py` (registry) · `scrapers.py` (disco
 
 ---
 
-## 8. Query examples
+## 8. Analytics layer
+
+A structured events store (DuckDB) unifying every sighting/event across
+sources, with a GeoNames location dimension, HDBSCAN hotspot/wave clustering,
+and corpus statistics. Rebuild order:
+
+```bash
+.venv/bin/python analytics_build.py       # data/analytics.duckdb: unified `events` table
+                                          #   (UFOSINT 618k + NUFORC 76k + corpus enrich_v2)
+.venv/bin/python analytics_locations.py   # GeoNames `locations` dimension; canonical
+                                          #   city→region→country + geocode coord-less events
+.venv/bin/python analytics_cluster.py     # geo_cluster hotspots + per-decade wave_cluster
+.venv/bin/python analytics_stats.py       # stats_* tables + ANALYTICS.md report
+.venv/bin/python analytics_index_meta.py  # denormalize cluster/location values into the
+                                          #   build index chunk metadata, then publish
+.venv/bin/python pipeline.py publish
+```
+
+GeoNames inputs live in `data/geonames/` (cities500, admin1, countryInfo).
+After publish, the retriever's `filters` accept the derived fields, e.g.
+`{"geo_cluster": 944}` or `{"loc_region": "New Mexico", "wave_cluster": "1960s:12"}`.
+
+---
+
+## 9. Query examples
 
 ```bash
 python pipeline.py query "what happened at Roswell"
