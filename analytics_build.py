@@ -36,11 +36,31 @@ con.execute("""CREATE TABLE events(
     city VARCHAR, region VARCHAR, country VARCHAR,
     lat DOUBLE, lng DOUBLE,
     shape VARCHAR, quality DOUBLE,
-    doc_ref VARCHAR)""")
+    doc_ref VARCHAR,
+    description VARCHAR, duration VARCHAR, num_witnesses INTEGER,
+    hynek VARCHAR, vallee VARCHAR, explanation VARCHAR, source_ref VARCHAR)""")
 
 rows = []
 COLS = ["event_id", "source", "origin", "event_date", "event_year", "city",
-        "region", "country", "lat", "lng", "shape", "quality", "doc_ref"]
+        "region", "country", "lat", "lng", "shape", "quality", "doc_ref",
+        "description", "duration", "num_witnesses", "hynek", "vallee",
+        "explanation", "source_ref"]
+
+# Detail-field hygiene (UFOSINT): explanation mixes real values ("Meteor",
+# "Hoax") with catalog symbols ("+", "-", "*") — keep only lettered values.
+# source_ref can run to ~6k chars of stacked citations — cap it.
+def _txt(v, cap=None):
+    if isinstance(v, (list, tuple)):
+        v = ", ".join(str(x) for x in v)
+    elif v is not None and not isinstance(v, str):
+        v = str(v)
+    v = (v or "").replace("\x00", "").strip()
+    return v[:cap] if cap else v
+
+
+def _explanation(v):
+    v = _txt(v)
+    return v if any(c.isalpha() for c in v) else ""
 
 
 def yr(d):
@@ -66,14 +86,24 @@ def flush():
 sc = sqlite3.connect(UFOSINT)
 n = 0
 for r in sc.execute("""SELECT s.id, o.name, s.date_event, l.city, l.state, l.country,
-                              l.latitude, l.longitude, s.standardized_shape, s.quality_score
+                              l.latitude, l.longitude, s.standardized_shape, s.quality_score,
+                              s.description, s.duration, s.num_witnesses,
+                              s.hynek, s.vallee, s.explanation, s.source_ref
                        FROM sighting s LEFT JOIN location l ON s.location_id=l.id
                        LEFT JOIN source_origin o ON s.origin_id=o.id"""):
-    sid, origin, date, city, state, country, lat, lng, shape, q = r
+    (sid, origin, date, city, state, country, lat, lng, shape, q,
+     desc, dur, wit, hynek, vallee, expl, sref) = r
     d = str(date)[:10] if date else None
+    try:
+        wit = int(wit) if wit is not None else None
+    except (ValueError, TypeError):
+        wit = None
     rows.append([f"ufosint_{sid}", "ufosint", origin or "", d, yr(date),
                  city or "", state or "", country or "",
-                 lat, lng, (shape or "").lower(), q, ""])
+                 lat, lng, (shape or "").lower(), q, "",
+                 _txt(desc), _txt(dur, 100), wit,
+                 _txt(hynek, 10), _txt(vallee, 10), _explanation(expl),
+                 _txt(sref, 600)])
     n += 1
     if len(rows) >= 20000:
         flush()
@@ -88,7 +118,7 @@ with open(NUFORC, encoding="utf-8", errors="ignore") as f:
     for row in csv.reader(f):
         if len(row) < 11:
             continue
-        dt, city, state, country, shape, _, _, desc, _, lat, lng = row[:11]
+        dt, city, state, country, shape, _, dur_txt, desc, _, lat, lng = row[:11]
         try:
             latf, lngf = float(lat), float(lng)
         except ValueError:
@@ -101,7 +131,8 @@ with open(NUFORC, encoding="utf-8", errors="ignore") as f:
                 continue
         rows.append([f"nuforc_{n}", "nuforc", "NUFORC", d, yr(d),
                      city.title(), state.upper(), (country or "").upper(),
-                     latf, lngf, (shape or "").lower(), None, ""])
+                     latf, lngf, (shape or "").lower(), None, "",
+                     _txt(desc), _txt(dur_txt, 100), None, "", "", "", ""])
         n += 1
         if len(rows) >= 20000:
             flush()
@@ -124,7 +155,9 @@ for p in glob.glob(str(ENR / "*.json")):
     rows.append([f"corpus_{Path(p).stem}", "corpus", e.get("source_program") or "",
                  str(date)[:10] if date else None, yr(date),
                  loc.get("city") or "", loc.get("region") or "", loc.get("country") or "",
-                 None, None, (shapes[0] if shapes else "").lower(), None, Path(p).stem])
+                 None, None, (shapes[0] if shapes else "").lower(), None, Path(p).stem,
+                 _txt(e.get("summary")), _txt(e.get("duration"), 100),
+                 None, "", "", "", ""])
     n += 1
     if len(rows) >= 20000:
         flush()
