@@ -2,7 +2,7 @@
 """
 Batch agreement/contradiction notes for multi-program events.
 -------------------------------------------------------------
-For every corpus.events row with program_count >= 2 (the event is attested
+For every corpus.incidents row with program_count >= 2 (the event is attested
 by documents from at least two source programs), pull the event's document
 summaries from corpus.chunks and ask Claude (claude-haiku-4-5-20251001) to
 emit {"agreements": [...], "contradictions": [...]}.
@@ -11,7 +11,7 @@ Results stream into data/event_notes.json incrementally (atomic tmp+rename
 every FLUSH_EVERY events) keyed by event_id, so an interrupted run resumes
 where it left off — already-noted events are skipped.
 
-The corpus.events table (and its program_count column) is being built by a
+The corpus.incidents table (and its program_count column) is being built by a
 separate job; if the column doesn't exist yet, the script polls briefly and
 then reports zero eligible events instead of crashing.
 
@@ -76,7 +76,7 @@ def connect():
 
 
 def wait_for_events_table(cur, attempts: int = 3, delay: float = 5.0) -> bool:
-    """True once corpus.events.program_count exists. The table is being
+    """True once corpus.incidents.program_count exists. The table is being
     (re)built by another job, so poll briefly instead of failing."""
     for i in range(attempts):
         cur.execute(
@@ -87,7 +87,7 @@ def wait_for_events_table(cur, attempts: int = 3, delay: float = 5.0) -> bool:
         if cur.fetchone():
             return True
         if i < attempts - 1:
-            print(f"corpus.events.program_count not present yet — "
+            print(f"corpus.incidents.program_count not present yet — "
                   f"retrying in {delay:.0f}s ({i + 1}/{attempts})")
             time.sleep(delay)
     return False
@@ -96,7 +96,7 @@ def wait_for_events_table(cur, attempts: int = 3, delay: float = 5.0) -> bool:
 def fetch_events(cur, limit: int | None):
     sql = """SELECT event_id, event_date, city, region, country, shape,
                     COALESCE(description, ''), COALESCE(doc_ref, '')
-             FROM corpus.events
+             FROM corpus.incidents
              WHERE program_count >= 2
              ORDER BY event_id"""
     if limit:
@@ -175,7 +175,7 @@ def main():
     cur = conn.cursor()
 
     if not wait_for_events_table(cur, attempts=3 if args.dry_run else 6):
-        print("corpus.events has no program_count column yet (table still "
+        print("corpus.incidents has no program_count column yet (table still "
               "being built by the events job).")
         print(f"Estimated eligible events: unknown (stubbed to 0). "
               f"Cost estimate: 0 x ${COST_PER_EVENT:.3f} = $0.00. "
