@@ -81,7 +81,7 @@ def wait_for_events_table(cur, attempts: int = 3, delay: float = 5.0) -> bool:
     for i in range(attempts):
         cur.execute(
             """SELECT 1 FROM information_schema.columns
-               WHERE table_schema='corpus' AND table_name='events'
+               WHERE table_schema='corpus' AND table_name='incidents'
                  AND column_name='program_count'"""
         )
         if cur.fetchone():
@@ -94,53 +94,44 @@ def wait_for_events_table(cur, attempts: int = 3, delay: float = 5.0) -> bool:
 
 
 def fetch_events(cur, limit: int | None):
-    sql = """SELECT event_id, event_date, city, region, country, shape,
-                    COALESCE(description, ''), COALESCE(doc_ref, '')
+    sql = """SELECT event_key, COALESCE(event_date::text, ''),
+                    COALESCE(array_to_string(source_programs, ', '), '')
              FROM corpus.incidents
              WHERE program_count >= 2
-             ORDER BY event_id"""
+             ORDER BY event_key"""
     if limit:
         sql += f" LIMIT {int(limit)}"
     cur.execute(sql)
     return cur.fetchall()
 
 
-def fetch_doc_summaries(cur, event_id: str, doc_ref: str):
-    """Distinct (filename, source_program, summary) for the event's docs.
-
-    Linkage: corpus-origin events carry doc_ref = the source document's
-    filename stem; chunks store the full filename in meta. Also matches
-    chunks whose related_case_ids mention the event_id, which is how the
-    cross-program linkage lands. Adjust here if the events build settles
-    on a dedicated docs column.
-    """
-    rows = []
-    if doc_ref:
-        cur.execute(
-            """SELECT DISTINCT meta->>'filename', meta->>'source_program',
-                               meta->>'summary'
-               FROM corpus.chunks
-               WHERE meta->>'summary' <> ''
-                 AND (meta->>'filename' LIKE %s
-                      OR meta->>'related_case_ids' LIKE %s)""",
-            [doc_ref + ".%", "%" + doc_ref + "%"])
-        rows = cur.fetchall()
-    return rows[:MAX_DOCS_PER_EVENT]
+def fetch_doc_summaries(cur, event_key: str):
+    """Distinct (filename, source_program, summary-or-excerpt) for the
+    event's documents, via corpus.incident_docs."""
+    cur.execute(
+        """SELECT DISTINCT ON (c.meta->>'filename')
+                  c.meta->>'filename', c.meta->>'source_program',
+                  COALESCE(NULLIF(c.meta->>'summary', ''), left(c.text, 600))
+           FROM corpus.incident_docs ed
+           JOIN corpus.chunks c ON c.meta->>'filename' = ed.filename
+           WHERE ed.event_key = %s
+           ORDER BY c.meta->>'filename', c.meta->>'chunk_id' = '-1' DESC""",
+        [event_key])
+    return cur.fetchall()[:MAX_DOCS_PER_EVENT]
 
 
 def build_prompt(event, docs) -> str:
-    (event_id, event_date, city, region, country, shape, desc, _doc_ref) = event
-    location = ", ".join(x for x in (city, region, country) if x) or "unknown"
+    (event_key, event_date, programs_str) = event
     programs = {d[1] or "unknown" for d in docs}
     doc_block = "\n\n".join(
         f"[{i + 1}] {fn or 'unknown file'} (program: {prog or 'unknown'})\n{summ}"
         for i, (fn, prog, summ) in enumerate(docs)
-    ) or "(no document summaries found — use the event description only)"
+    ) or "(no document summaries found)"
     return USER_PROMPT.format(
-        event_id=event_id, event_date=event_date or "unknown",
-        location=location, shape=shape or "unknown",
-        description=(desc or "")[:2000], n_programs=len(programs),
-        doc_block=doc_block)
+        event_id=event_key, event_date=event_date or "unknown",
+        location="see documents", shape="see documents",
+        description=f"Reported through: {programs_str or 'unknown programs'}",
+        n_programs=len(programs), doc_block=doc_block)
 
 
 def parse_response(text: str) -> dict:
@@ -189,7 +180,7 @@ def main():
 
     if args.dry_run:
         if events:
-            docs = fetch_doc_summaries(cur, events[0][0], events[0][7])
+            docs = fetch_doc_summaries(cur, events[0][0])
             print("\n--- first prompt (system) ---\n" + SYSTEM_PROMPT)
             print("\n--- first prompt (user) ---\n" + build_prompt(events[0], docs))
         print("\nDry run complete — no API calls made, nothing written.")
@@ -210,7 +201,7 @@ def main():
     try:
         for i, event in enumerate(pending):
             event_id = event[0]
-            docs = fetch_doc_summaries(cur, event_id, event[7])
+            docs = fetch_doc_summaries(cur, event_id)
             prompt = build_prompt(event, docs)
             try:
                 resp = client.messages.create(
