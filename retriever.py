@@ -258,7 +258,7 @@ def _get_reranker():
 
 
 def retrieve(question, n=5, filters=None, mode="hybrid"):
-    n = max(1, min(n, 25))
+    n = max(1, min(n, 50))  # deep research profiles page the full fusion pool
     # With reranking on, pull the whole fused pool and let the cross-encoder
     # pick the final top-n; otherwise fetch exactly n as before.
     fetch = max(POOL, n) if RERANK else n
