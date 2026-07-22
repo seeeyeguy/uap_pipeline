@@ -23,8 +23,18 @@ ENV HF_HOME=/opt/hf-cache
 RUN python -c "from huggingface_hub import snapshot_download; \
     snapshot_download('BAAI/bge-m3', ignore_patterns=['onnx/*', '*.onnx', 'imgs/*'])"
 
+# Optional cross-encoder rerank stage (runtime env RERANK=1). Bake the model
+# with --build-arg PRELOAD_RERANKER=1 — required before enabling RERANK in
+# prod, where the container has no network and no writable HF cache. Adds
+# ~2.2GB to the image; default build is unchanged. Budget ~2GB extra RSS.
+ARG PRELOAD_RERANKER=0
+RUN if [ "$PRELOAD_RERANKER" = "1" ]; then \
+      python -c "from huggingface_hub import snapshot_download; \
+        snapshot_download('BAAI/bge-reranker-v2-m3', ignore_patterns=['onnx/*', '*.onnx', 'imgs/*'])"; \
+    fi
+
 WORKDIR /app
-COPY main.py retriever.py textqc.py ./
+COPY main.py retriever.py textqc.py query_expansion.py ./
 
 # 0.0.0.0 so the port is reachable from outside the container; compose
 # publishes it on localhost only. VECTORDB_DIR matches the compose mount.

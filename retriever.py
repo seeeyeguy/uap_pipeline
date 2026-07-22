@@ -19,11 +19,25 @@ Two backends:
 Queries embed with the pipeline's exact model (BAAI/bge-m3), so they land
 in the same 1024-dim space the corpus was built in.
 
+Query expansion (pg backend): a static domain synonym map (query_expansion.py)
+adds OR-variants of the query to the two LEXICAL arms only — the dense arm
+always embeds the user's exact wording.
+
+Optional rerank stage (RERANK=1, default off): after RRF fusion the full
+candidate pool (POOL=50) is rescored by a cross-encoder
+(BAAI/bge-reranker-v2-m3 via sentence-transformers CrossEncoder) against the
+query text, and the top-k by reranker score are returned. The model is
+lazy-loaded on the first reranked request. MEMORY COST: the reranker adds
+roughly 2 GB RSS (~560M params + activations) on top of bge-m3 — raise the
+container memory limit accordingly before enabling in prod. Response stays
+backward-compatible: existing fields are unchanged; each chunk additionally
+carries "rerank_score" (and "score" keeps the RRF fusion score).
+
 Endpoints:
   POST /retrieve  {"question": str, "n": int=5, "filters": {..}?,
                    "mode": "hybrid"|"dense"?}
        -> {"chunks": [{"id","text","distance","score","source",
-                       "document_type","summary"}]}
+                       "document_type","summary"[,"rerank_score"]}]}
   GET  /health    -> {"status":"ok","backend":..,"chunks":N}
 
 Run (from the pipeline venv, so bge-m3 + the GPU are available):
@@ -38,6 +52,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from main import load_embed_model, load_vectordb, COLLECTION_NAME
+from query_expansion import expand_query
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -48,6 +63,11 @@ PORT = int(os.environ.get("RETRIEVER_PORT", "8001"))
 PG_DSN = os.environ.get("PG_DSN", "")
 RRF_K = 60          # standard reciprocal-rank-fusion constant
 POOL = 50           # candidates fetched per arm before fusion
+
+# Optional cross-encoder rerank stage (see module docstring; ~2GB extra RSS).
+RERANK = os.environ.get("RERANK", "") == "1"
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", "1024"))
 
 log.info("Loading embedder (bge-m3)…")
 EMBEDDER = load_embed_model()
@@ -158,14 +178,20 @@ class PgBackend:
             [vec, *fparams, vec, pool])
         arms = [dense]
         if mode != "dense":
+            # Domain synonym expansion, lexical arms only: OR the tsqueries
+            # of the original question and its single-substitution variants.
+            # (tsquery || tsquery is OR; an empty tsquery operand is a no-op.)
+            variants = expand_query(question)
+            tsq = " || ".join(["websearch_to_tsquery(%s, %s)"] * len(variants))
             for cfg, col in (("simple", "tsv_simple"), ("english", "tsv_en")):
+                vparams = [p for v in variants for p in (cfg, v)]
                 arms.append(self._run(
                     f"""SELECT id, text, meta, NULL::float AS dist
                         FROM corpus.chunks,
-                             websearch_to_tsquery(%s, %s) q
+                             (SELECT {tsq}) AS qx(q)
                         WHERE {col} @@ q AND {where}
                         ORDER BY ts_rank_cd({col}, q) DESC LIMIT %s""",
-                    [cfg, question, *fparams, pool]))
+                    [*vparams, *fparams, pool]))
 
         # reciprocal-rank fusion across arms
         fused = {}
@@ -216,13 +242,40 @@ else:
 log.info("Ready: backend=%s, %d chunks", BACKEND.name, BACKEND.count())
 
 
+_RERANKER = None
+
+
+def _get_reranker():
+    """Lazy-load the cross-encoder on the first reranked request (~2GB RSS).
+    Callers must hold _LOCK."""
+    global _RERANKER
+    if _RERANKER is None:
+        from sentence_transformers import CrossEncoder
+        log.info("Loading reranker %s (first RERANK request)…", RERANK_MODEL)
+        _RERANKER = CrossEncoder(RERANK_MODEL, max_length=RERANK_MAX_LENGTH)
+        log.info("Reranker loaded.")
+    return _RERANKER
+
+
 def retrieve(question, n=5, filters=None, mode="hybrid"):
+    n = max(1, min(n, 50))  # deep research profiles page the full fusion pool
+    # With reranking on, pull the whole fused pool and let the cross-encoder
+    # pick the final top-n; otherwise fetch exactly n as before.
+    fetch = max(POOL, n) if RERANK else n
     with _LOCK:
         emb = EMBEDDER.encode([question], normalize_embeddings=True)[0].tolist()
-        rows = BACKEND.query(emb, question, max(1, min(n, 25)), filters, mode)
+        rows = BACKEND.query(emb, question, fetch, filters, mode)
+        rerank_scores = None
+        if RERANK and rows:
+            scores = _get_reranker().predict(
+                [(question, r[1] or "") for r in rows])
+            order = sorted(range(len(rows)),
+                           key=lambda i: -float(scores[i]))[:n]
+            rerank_scores = [float(scores[i]) for i in order]
+            rows = [rows[i] for i in order]
     out = []
-    for cid, text, meta, dist, score in rows:
-        out.append({
+    for i, (cid, text, meta, dist, score) in enumerate(rows):
+        chunk = {
             "id":            cid,
             "text":          text,
             "distance":      dist,
@@ -230,7 +283,10 @@ def retrieve(question, n=5, filters=None, mode="hybrid"):
             "source":        meta.get("filename") or meta.get("source") or "",
             "document_type": meta.get("document_type", ""),
             "summary":       meta.get("summary", ""),
-        })
+        }
+        if rerank_scores is not None:
+            chunk["rerank_score"] = rerank_scores[i]
+        out.append(chunk)
     return out
 
 

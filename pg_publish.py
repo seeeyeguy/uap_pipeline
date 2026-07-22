@@ -10,7 +10,9 @@ into the `corpus` schema of the app's Postgres:
                        tsv_simple + tsv_en (generated) for lexical search
   corpus.events        the unified analytics events table
   corpus.locations     GeoNames dimension
-  corpus.geo_clusters  hotspot summary
+  corpus.geo_clusters  hotspot summary (spatial)
+  corpus.st_clusters   wave summary (spatiotemporal)
+  corpus.time_clusters flap-period summary (temporal)
   corpus.stats_*       statistics passes
 
 Each table loads into <name>_new and swaps in a single transaction, so the
@@ -147,11 +149,19 @@ def sync_analytics(pg):
         swap(cur, t)
         pg.commit()
         print(f"  corpus.{t}: {len(rows)} rows", flush=True)
+    # tables retired from the build store linger in corpus.* — drop them
+    cur.execute("DROP TABLE IF EXISTS corpus.stats_waves CASCADE")
+    cur.execute("DROP TABLE IF EXISTS corpus.stats_waves_old CASCADE")
     # indexes the API needs (recreate every publish — tables were swapped)
     for ddl in ("CREATE INDEX IF NOT EXISTS events_cluster_idx ON corpus.events (geo_cluster)",
-                "CREATE INDEX IF NOT EXISTS events_wave_idx ON corpus.events (wave_cluster)",
+                "CREATE INDEX IF NOT EXISTS events_st_cluster_idx ON corpus.events (st_cluster)",
+                "CREATE INDEX IF NOT EXISTS events_time_cluster_idx ON corpus.events (time_cluster)",
                 "CREATE INDEX IF NOT EXISTS events_year_idx ON corpus.events (event_year)",
-                "CREATE INDEX IF NOT EXISTS events_region_idx ON corpus.events (loc_cc, loc_region)"):
+                "CREATE INDEX IF NOT EXISTS events_region_idx ON corpus.events (loc_cc, loc_region)",
+                # advanced search: ILIKE over descriptions/citations (map filters)
+                "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+                "CREATE INDEX IF NOT EXISTS events_desc_trgm_idx ON corpus.events USING gin (description gin_trgm_ops)",
+                "CREATE INDEX IF NOT EXISTS events_sref_trgm_idx ON corpus.events USING gin (source_ref gin_trgm_ops)"):
         cur.execute(ddl)
     pg.commit()
     con.close()

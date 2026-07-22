@@ -95,6 +95,42 @@ python pipeline.py all \
 
 > Note: `--sources` is accepted by `ingest` but ignored — ingest processes the whole `--downloads-dir` tree. Restrict at download time instead.
 
+### Scoped AFU drains
+
+`--afu-dirs` restricts the AFU crawl to specific directories of files.afu.se —
+use a separate `--manifest-dir` so the scoped manifest never clobbers the main
+one (the ledger `data/downloads.json` is shared and append-only either way).
+
+The UFO Newsclipping Service drain (492 monthly issues, 1969–2011 — local-press
+UFO stories worldwide, the primary source for "reported only in the county
+paper" lore; first drained 2026-07-20):
+
+```bash
+python pipeline.py discover --scrape --sources afu_se \
+  --afu-dirs "Magazines/United States/UFO Newsclipping Service" \
+  --afu-max-files 600 --manifest-dir data/manifest_ncs
+python pipeline.py download --sources afu_se --manifest-dir data/manifest_ncs
+```
+
+Nearby shelves worth the same treatment later: `Magazines/United States/APCIC
+clipping service`, the `Clippings/` tree (US/UK/Sweden), and the state-MUFON
+newsletter runs under `Magazines/United States/MUFON *`.
+
+### Post-publish backfills — ALWAYS re-run after pg_publish
+
+`pg_publish.py` regenerates `corpus.chunks` from the build store, which
+discards any metadata applied directly to Postgres. Currently that means the
+NUFORC per-report URLs. After every publish (dev AND prod):
+
+```bash
+python backfill_nuforc_urls.py --apply          # idempotent, ~8 min
+```
+
+`corpus.admin_areas` / `admin_area_towns` / `admin_area_adj` are published by
+`build_admin_areas.py`, not pg_publish, and survive the swap untouched — but
+if `corpus.locations` gains/loses rows, re-run `build_admin_areas.py --apply`
+so town membership stays aligned.
+
 ---
 
 ## 5. Sources covered
