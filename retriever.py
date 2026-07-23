@@ -93,6 +93,15 @@ def _cond(key, value, params):
                 else:
                     clauses.append(f"meta->>'{key}' IN ({ph})")
                 params.extend(v)
+            elif op == "$eq_or_unknown":
+                # Equality that tolerates unknown metadata: chunks whose
+                # location was never resolved (absent key or "") must not be
+                # excluded by a planner-derived geography filter — that
+                # silently starved recall (the Portage County case file has
+                # loc_region "" and lost to 36 lookalike Ohio one-pagers).
+                clauses.append(
+                    f"(meta->>'{key}' = %s OR coalesce(meta->>'{key}','') = '')")
+                params.append(v)
             elif op in _OPS:
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     clauses.append(f"(meta->>'{key}')::numeric {_OPS[op]} %s")
