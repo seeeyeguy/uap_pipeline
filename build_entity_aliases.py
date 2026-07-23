@@ -36,6 +36,7 @@ Usage:
 Without --apply it prints the merge report and exits (dry run).
 """
 import argparse
+import json
 import os
 import re
 from collections import defaultdict
@@ -100,28 +101,37 @@ def dsn():
     return f"postgresql://{user}:{pw}@localhost:5439/{db}"
 
 
+# Tokens that are titles/branches/noise anywhere in a name, not name parts.
+NOISE = {"usaf", "usn", "usa", "usmc", "usarmy", "ret", "retired"}
+
+
 def norm_tokens(name: str) -> list[str]:
     """Lowercased tokens with punctuation stripped; initials keep one letter.
 
-    "Last, First [Middle]" comma forms are re-ordered to "First Last" first;
-    a comma followed only by suffixes/honorifics ("Quintanilla, Jr.",
-    "Hynek, Dr.") just drops the tail.
+    Comma segments that are ONLY suffixes/honorifics/branch noise are dropped
+    ("Quintanilla, Jr., Major, USAF" -> "quintanilla"); exactly two real
+    segments left means "Last, First" and re-orders ("Quintanilla, Hector").
+    Honorific and branch tokens are filtered wherever they appear — comma
+    flattening and parentheticals put them mid-name.
     """
     s = name.lower()
+    drop = SUFFIXES | HONORIFICS | NOISE
+
+    def toks_of(seg: str) -> list[str]:
+        return re.sub(r"[^a-z0-9& ]+", " ", seg).split()
+
     if "," in s:
-        head, _, tail = s.partition(",")
-        tail_toks = re.sub(r"[^a-z0-9& ]+", " ", tail).split()
-        if tail_toks and all(t in SUFFIXES | HONORIFICS for t in tail_toks):
-            s = head
-        elif tail_toks:
-            s = tail + " " + head
-    s = re.sub(r"[^a-z0-9& ]+", " ", s)
-    toks = s.split()
-    while toks and toks[0] in HONORIFICS:
-        toks = toks[1:]
+        segs = [seg for seg in s.split(",") if toks_of(seg)]
+        keep = [seg for seg in segs
+                if not all(t in drop for t in toks_of(seg))]
+        if len(keep) == 2:
+            s = keep[1] + " " + keep[0]  # Last, First -> First Last
+        else:
+            s = " ".join(keep) if keep else s
+    toks = [t for t in toks_of(s) if t not in HONORIFICS | NOISE]
     while toks and toks[-1] in SUFFIXES:
         toks = toks[:-1]
-    return toks
+    return [t for t in toks if t not in SUFFIXES]
 
 
 def token_equiv(x: str, y: str) -> bool:
@@ -420,25 +430,302 @@ def build(names_by_etype, doc_counts):
     return aliases, report
 
 
+# ════════════════════════════════════════════════════════════════════
+# Pass 4 — LLM adjudication of the ambiguous residue (--llm).
+# Deterministic passes leave clusters unmerged whenever evidence is
+# ambiguous ("Maj H Quintanilla" vs "Hector Quintanilla"; NICAP vs its
+# expansion with no parenthetical). A cheap model judges exactly those
+# candidate pairs; verdicts cache on disk so re-runs only pay for new
+# names. "different"/"unsure" verdicts are no-ops — under-merging stays
+# the failure mode.
+# ════════════════════════════════════════════════════════════════════
+VERDICT_CACHE = ROOT / "data/entity_alias_verdicts.json"
+LLM_MODEL = "claude-haiku-4-5-20251001"
+PAIRS_PER_CALL = 25
+MAX_PAIRS = 3000
+
+ADJUDICATE_PROMPT = """You are resolving entity aliases for a UAP/UFO document archive \
+(1947-present: Project Blue Book, NICAP, MUFON, AARO, international agencies).
+For each numbered pair below, decide whether the two names refer to the SAME \
+real-world {kind}. Each side lists known spelling variants, how many archive \
+documents mention it, and sample source documents.
+
+Answer with ONLY a JSON array, one object per pair:
+  {{"id": <n>, "verdict": "same"|"different"|"unsure", "canonical": "<best display name>"}}
+
+Rules:
+- "same" ONLY when confident; historical figures in this domain (Blue Book \
+officers, ufologists) are strong priors when ranks/eras align.
+- Different middle initials, different sub-organizations, or a parent org vs \
+its field office => "different".
+- When evidence is thin, answer "unsure". Never guess.
+- "canonical" must be copied exactly from one of the pair's listed names.
+
+{pairs}"""
+
+
+def cluster_info(etype, canonical, aliases, doc_counts, samples):
+    members = [a for (t, a), c in aliases.items()
+               if t == etype and c == canonical]
+    docs = doc_counts.get((etype, canonical), 0) + \
+        sum(doc_counts.get((etype, m), 0) for m in members)
+    files = samples.get((etype, canonical), [])[:3]
+    return {"canonical": canonical, "variants": sorted(members)[:4],
+            "docs": docs, "samples": files}
+
+
+def edit1(a: str, b: str) -> bool:
+    """Levenshtein distance exactly 1, for full-name tokens of length >= 4
+    (OCR corruptions: Hector/Nectar/Lector, Guintanilla/Quintanilla)."""
+    if len(a) < 4 or len(b) < 4 or a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    short, long = (a, b) if len(a) < len(b) else (b, a)
+    for i in range(len(long)):
+        if short == long[:i] + long[i + 1:]:
+            return True
+    return False
+
+
+def strict_initials(inner: str, outer: str) -> bool:
+    """Exact initialism: every significant word of `outer` contributes exactly
+    its first letter, in order. Cross-canonical pairing has no document
+    asserting the link, so the loose prefix matcher (fine for parentheticals)
+    would drown the judge in "AFIC ~ Army Finner Camp" noise."""
+    inner_l = re.sub(r"[^a-z0-9]", "", inner.lower())
+    words = [w for w in norm_tokens(outer) if w not in ACRO_STOP]
+    return len(words) >= 2 and inner_l == "".join(w[0] for w in words)
+
+
+def gen_candidates(aliases, names_by_etype, doc_counts):
+    """Pairs of post-pass canonical clusters worth an LLM look."""
+    person_pairs, org_pairs = [], []
+    aliased = set(aliases)
+    for etype, names in names_by_etype.items():
+        canons = [n for n in names
+                  if (etype, n) not in aliased and not PLACEHOLDER_RE.search(n)]
+        if etype == "person":
+            by_surname = defaultdict(list)
+            for n in canons:
+                toks = norm_tokens(n)
+                if len(toks) >= 2:
+                    by_surname[toks[-1]].append((n, toks[:-1]))
+            for entries in by_surname.values():
+                if len(entries) < 2:
+                    continue
+                block = []
+                for i, (n1, g1) in enumerate(entries):
+                    for n2, g2 in entries[i + 1:]:
+                        # pairs the deterministic passes found plausible but
+                        # unprovable: positionally compatible givens, or an
+                        # OCR-corruption-distance first name (Nectar/Lector/
+                        # Rector/Sector all ~ Hector).
+                        if given_compatible(g1, g2) or (
+                                g1 and g2 and edit1(g1[0], g2[0])):
+                            block.append((etype, n1, n2))
+                # Cap per block: a genuinely-ambiguous surname (Smith) yields
+                # few plausible pairs anyway; runaway blocks get truncated
+                # rather than dropped wholesale.
+                person_pairs.extend(block[:60])
+        elif etype == "organization":
+            singles = [n for n in canons if " " not in norm_key(n)]
+            multis = [n for n in canons if " " in norm_key(n)]
+            for s in singles:
+                hits = [m for m in multis if strict_initials(s, m)]
+                if 0 < len(hits) <= 5:  # generic initialisms match everything
+                    org_pairs.extend((etype, s, m) for m in hits)
+    # Persons first: they are the higher-value merges if the cap bites.
+    return (person_pairs + org_pairs)[:MAX_PAIRS]
+
+
+def pair_key(etype, a, b):
+    import hashlib
+    lo, hi = sorted((a, b))
+    return hashlib.sha256(f"{etype}|{lo}|{hi}".encode()).hexdigest()[:24]
+
+
+def adjudicate(candidates, aliases, doc_counts, samples):
+    import anthropic
+    cache = {}
+    if VERDICT_CACHE.exists():
+        cache = json.loads(VERDICT_CACHE.read_text())
+    todo = [c for c in candidates if pair_key(*c) not in cache]
+    print(f"pass 4: {len(candidates)} candidate pairs "
+          f"({len(candidates) - len(todo)} cached, {len(todo)} to adjudicate)")
+    if todo:
+        client = anthropic.Anthropic()
+        for start in range(0, len(todo), PAIRS_PER_CALL):
+            batch = todo[start:start + PAIRS_PER_CALL]
+            lines = []
+            for i, (etype, a, b) in enumerate(batch):
+                ia = cluster_info(etype, a, aliases, doc_counts, samples)
+                ib = cluster_info(etype, b, aliases, doc_counts, samples)
+                lines.append(f"Pair {i}:\n  A: {json.dumps(ia)}\n  B: {json.dumps(ib)}")
+            kind = batch[0][0]
+            msg = client.messages.create(
+                model=LLM_MODEL, max_tokens=4000,
+                messages=[{"role": "user", "content": ADJUDICATE_PROMPT.format(
+                    kind=kind, pairs="\n".join(lines))}])
+            text = msg.content[0].text.strip()
+            text = text.removeprefix("```json").removeprefix("```").removesuffix("```")
+            try:
+                verdicts = json.loads(text.strip())
+            except json.JSONDecodeError:
+                print(f"  batch at {start}: unparseable response, skipping")
+                continue
+            for v in verdicts:
+                try:
+                    etype, a, b = batch[int(v["id"])]
+                except (KeyError, ValueError, IndexError):
+                    continue
+                cache[pair_key(etype, a, b)] = {
+                    "etype": etype, "a": a, "b": b,
+                    "verdict": v.get("verdict", "unsure"),
+                    "canonical": v.get("canonical", ""),
+                }
+            print(f"  adjudicated {min(start + PAIRS_PER_CALL, len(todo))}/{len(todo)}")
+            VERDICT_CACHE.write_text(json.dumps(cache, indent=1))
+    return cache
+
+
+def initials_only(name):
+    toks = norm_tokens(name)
+    return not full_names(toks[:-1]) if len(toks) >= 2 else False
+
+
+def apply_verdicts(aliases, candidates, cache, doc_counts):
+    """Merge 'same' verdicts. Full-name pairs are hard edges (the judge saw
+    both real names); an initials-only name attaches to exactly ONE partner
+    cluster — "E. E. Brown" judged same as both Earl E. and Eugene E. Brown
+    must not transitively fuse Earl with Eugene."""
+    uf = Clusters()
+    chosen = {}  # preferred canonical votes
+    deferred = defaultdict(set)  # initials-only name -> same-partners
+    merged = 0
+    for etype, a, b in candidates:
+        v = cache.get(pair_key(etype, a, b))
+        if not v or v["verdict"] != "same":
+            continue
+        merged += 1
+        if v.get("canonical") in (a, b):
+            chosen[(etype, v["canonical"])] = True
+        ia, ib = initials_only(a), initials_only(b)
+        if etype == "person" and ia != ib:
+            init, full = (a, b) if ia else (b, a)
+            deferred[(etype, init)].add((etype, full))
+            continue
+        uf.union((etype, a), (etype, b))
+    for init, partners in deferred.items():
+        uf.add(init)
+        for p in partners:
+            uf.add(p)
+        roots = {uf.find(p) for p in partners}
+        if len(roots) == 1:
+            uf.union(init, next(iter(roots)))
+        # multiple distinct partner clusters: ambiguous, leave unmerged
+    # Canonical choice weighs the CLUSTER (own docs + every name already
+    # aliased to it) — raw-spelling counts made the OCR corruption "Rector
+    # Quintanilla" outrank Hector, whose documents live under 29 variants.
+    cluster_docs = defaultdict(int)
+    for key, d in doc_counts.items():
+        cluster_docs[(key[0], aliases.get(key, key[1]))] += d
+    for group in uf.groups():
+        if len(group) < 2:
+            continue
+        # Weight first, LLM canonical vote only as tie-break: a vote on an
+        # OCR-variant pair must never outrank a 700-doc cluster.
+        best = max(group, key=lambda it: (
+            cluster_docs.get(it, 0), 1 if chosen.get(it) else 0, it[1]))
+        etype, canonical = best
+        for t, name in group:
+            if name == canonical:
+                continue
+            aliases[(t, name)] = canonical
+            # re-point this cluster's existing aliases at the new canonical
+            for key, c in list(aliases.items()):
+                if key[0] == t and c == name and key[1] != canonical:
+                    aliases[key] = canonical
+    # drop any accidental self-mappings
+    for key in [k for k, c in aliases.items() if k[1] == c]:
+        del aliases[key]
+    print(f"pass 4: {merged} pairs judged same; aliases now {len(aliases)}")
+    return aliases
+
+
+def adopt_bare_surnames(aliases, names_by_etype, doc_counts):
+    """Re-run pass 3 after LLM merges: clusters that became dominant can now
+    adopt the bare/title-only surname forms ("Maj Quintanilla")."""
+    etype = "person"
+    canon_docs = defaultdict(int)
+    for n in names_by_etype.get(etype, ()):
+        if PLACEHOLDER_RE.search(n):
+            continue
+        target = aliases.get((etype, n), n)
+        canon_docs[target] += doc_counts.get((etype, n), 0)
+    canon_by_surname = defaultdict(set)
+    for n in names_by_etype.get(etype, ()):
+        if (etype, n) in aliases or PLACEHOLDER_RE.search(n):
+            continue
+        toks = norm_tokens(n)
+        if len(toks) >= 2:
+            canon_by_surname[toks[-1]].add(n)
+    adopted = 0
+    for n in names_by_etype.get(etype, ()):
+        if (etype, n) in aliases or PLACEHOLDER_RE.search(n):
+            continue
+        toks = norm_tokens(n)
+        if len(toks) != 1:
+            continue
+        owners = canon_by_surname.get(toks[0], set())
+        if not owners:
+            continue
+        if len(owners) == 1:
+            winner = next(iter(owners))
+        else:
+            ranked = sorted(owners, key=lambda o: -canon_docs[o])
+            total = sum(canon_docs[o] for o in owners)
+            if total < 10 or canon_docs[ranked[0]] < 0.9 * total:
+                continue
+            winner = ranked[0]
+        aliases[(etype, n)] = winner
+        adopted += 1
+    if adopted:
+        print(f"pass 4b: {adopted} bare-surname forms adopted post-merge")
+    return aliases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true",
                     help="write corpus.entity_aliases (default: dry-run report)")
     ap.add_argument("--report", type=int, default=25,
                     help="show the N largest merge clusters")
+    ap.add_argument("--llm", action="store_true",
+                    help="pass 4: LLM-adjudicate the ambiguous residue"
+                         " (needs ANTHROPIC_API_KEY; verdicts cache on disk)")
     args = ap.parse_args()
 
     with psycopg.connect(dsn()) as pg:
         rows = pg.execute(
-            "SELECT name, etype, count(DISTINCT filename) FROM corpus.entities"
-            " GROUP BY 1, 2").fetchall()
+            "SELECT name, etype, count(DISTINCT filename),"
+            " (array_agg(DISTINCT filename))[1:3]"
+            " FROM corpus.entities GROUP BY 1, 2").fetchall()
     names_by_etype = defaultdict(set)
     doc_counts = {}
-    for name, etype, docs in rows:
+    samples = {}
+    for name, etype, docs, files in rows:
         names_by_etype[etype].add(name)
         doc_counts[(etype, name)] = docs
+        samples[(etype, name)] = files or []
 
     aliases, report = build(names_by_etype, doc_counts)
+
+    if args.llm:
+        candidates = gen_candidates(aliases, names_by_etype, doc_counts)
+        cache = adjudicate(candidates, aliases, doc_counts, samples)
+        aliases = apply_verdicts(aliases, candidates, cache, doc_counts)
+        aliases = adopt_bare_surnames(aliases, names_by_etype, doc_counts)
 
     total = sum(len(v) for v in names_by_etype.values())
     merged_groups = [r for r in report if r[2]]
