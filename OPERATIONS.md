@@ -126,6 +126,17 @@ NUFORC per-report URLs. After every publish (dev AND prod):
 python backfill_nuforc_urls.py --apply          # idempotent, ~8 min
 ```
 
+The serving-side data layer must also be rebuilt (the swap wipes
+`source_tier` and the entity/catalog tables are built FROM chunks):
+
+```bash
+# in uap-api, as the uap owner:
+psql ... < db/search_upgrade.sql                # ~20 min: tiers + incidents + entities
+psql ... < db/catalog.sql                       # seconds: public catalog table
+# then back here:
+python build_entity_aliases.py --apply          # seconds: canonical entity aliases
+```
+
 `corpus.admin_areas` / `admin_area_towns` / `admin_area_adj` are published by
 `build_admin_areas.py`, not pg_publish, and survive the swap untouched — but
 if `corpus.locations` gains/loses rows, re-run `build_admin_areas.py --apply`
