@@ -134,7 +134,9 @@ The serving-side data layer must also be rebuilt (the swap wipes
 psql ... < db/search_upgrade.sql                # ~20 min: tiers + incidents + entities
 psql ... < db/catalog.sql                       # seconds: public catalog table
 # then back here:
-python build_entity_aliases.py --apply          # seconds: canonical entity aliases
+python build_entity_aliases.py --llm --apply   # canonical entity aliases; --llm
+                                                # adjudicates the ambiguous residue
+                                                # (Haiku, verdicts cached on disk)
 ```
 
 `corpus.admin_areas` / `admin_area_towns` / `admin_area_adj` are published by
