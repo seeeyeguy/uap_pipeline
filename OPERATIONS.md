@@ -134,6 +134,10 @@ The serving-side data layer must also be rebuilt (the swap wipes
 psql ... < db/search_upgrade.sql                # ~20 min: tiers + incidents + entities
 psql ... < db/catalog.sql                       # seconds: public catalog table
 # then back here:
+python backfill_locations.py --apply --llm     # location metadata for case files
+                                                # (filename parse + text extraction;
+                                                # verdicts cached; --chroma to also
+                                                # fix the build store after ingests)
 python build_entity_aliases.py --llm --apply   # canonical entity aliases; --llm
                                                 # adjudicates the ambiguous residue
                                                 # (Haiku, verdicts cached on disk)

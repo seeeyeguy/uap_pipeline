@@ -575,7 +575,7 @@ ENRICHMENT_USER_PROMPT = """Analyze the following document text and return a JSO
   "event_location": {{
     "country": "string or null",
     "region": "state/province/region or null",
-    "city": "string or null",
+    "city": "string or null (if the document covers MULTIPLE nearby towns, use the primary/first one — never null just because there are several)",
     "site": "specific site name (e.g. air base, lake) or null"
   }},
   "entities": {{
