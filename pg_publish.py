@@ -118,8 +118,13 @@ def sync_chunks(pg):
     cur.execute("SET maintenance_work_mem = '2GB'")
     cur.execute("SET max_parallel_maintenance_workers = 8")
     t0 = time.time()
+    # Parallel HNSW builds allocate multi-GB shared-memory segments — more
+    # than a container's /dev/shm may allow as the corpus grows (prod's 2 GB
+    # cap failed at 384k chunks). Single-threaded is slower but bounded.
+    cur.execute("SET max_parallel_maintenance_workers = 0")
     cur.execute("""CREATE INDEX chunks_new_embedding_idx ON corpus.chunks_new
                    USING hnsw (embedding vector_cosine_ops)""")
+    cur.execute("RESET max_parallel_maintenance_workers")
     print(f"  hnsw index: {time.time()-t0:.0f}s", flush=True)
     cur.execute("CREATE INDEX chunks_new_tsv_simple_idx ON corpus.chunks_new USING gin (tsv_simple)")
     cur.execute("CREATE INDEX chunks_new_tsv_en_idx ON corpus.chunks_new USING gin (tsv_en)")
