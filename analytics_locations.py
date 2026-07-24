@@ -193,6 +193,15 @@ con.register("_loc", ldf)
 con.execute("INSERT INTO locations SELECT * FROM _loc")
 con.unregister("_loc")
 
+# The geo columns must exist BEFORE the reset below: analytics_build
+# recreates `events` bare, so a cold run has no geo_src yet (the reset
+# then correctly touches 0 rows).
+for col, typ in [("location_id", "BIGINT"), ("loc_city", "VARCHAR"),
+                 ("loc_region", "VARCHAR"), ("loc_country", "VARCHAR"),
+                 ("loc_cc", "VARCHAR"), ("loc_match", "VARCHAR"),
+                 ("geo_src", "VARCHAR")]:
+    con.execute(f"ALTER TABLE events ADD COLUMN IF NOT EXISTS {col} {typ}")
+
 # re-runs must not keep coordinates a previous (possibly wrong) city match
 # assigned — only source-provided coordinates survive the reset
 con.execute("UPDATE events SET lat=NULL, lng=NULL WHERE geo_src='geonames'")
@@ -217,11 +226,6 @@ print("match levels:", dict(sorted(counts.items())), flush=True)
 res = pd.DataFrame(out, columns=["city", "region", "country", "location_id",
                                  "loc_city", "loc_region", "loc_country",
                                  "loc_cc", "loc_match", "glat", "glng"])
-for col, typ in [("location_id", "BIGINT"), ("loc_city", "VARCHAR"),
-                 ("loc_region", "VARCHAR"), ("loc_country", "VARCHAR"),
-                 ("loc_cc", "VARCHAR"), ("loc_match", "VARCHAR"),
-                 ("geo_src", "VARCHAR")]:
-    con.execute(f"ALTER TABLE events ADD COLUMN IF NOT EXISTS {col} {typ}")
 con.register("_res", res)
 con.execute("""UPDATE events e SET
     location_id=r.location_id, loc_city=r.loc_city, loc_region=r.loc_region,

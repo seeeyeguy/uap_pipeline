@@ -73,7 +73,7 @@ print(f"NUFORC map: {len(chunk2event)} chunk ids over {n} events", flush=True)
 con = duckdb.connect(str(DB))
 events = {}
 for (eid, gc, wc, lid, lcity, lregion, lcountry, lcc, lat, lng) in con.execute(
-        """SELECT event_id, geo_cluster, wave_cluster, location_id, loc_city,
+        """SELECT event_id, geo_cluster, st_cluster, location_id, loc_city,
                   loc_region, loc_country, loc_cc, lat, lng FROM events"""
         ).fetchall():
     events[eid] = (gc, wc, lid, lcity, lregion, lcountry, lcc, lat, lng)
