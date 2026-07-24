@@ -124,7 +124,14 @@ NUFORC per-report URLs. After every publish (dev AND prod):
 
 ```bash
 python backfill_nuforc_urls.py --apply          # idempotent, ~8 min
+docker exec -i uap-api-postgres-1 psql -U uap -d uapdb < ../uap-api/db/catalog.sql
+python build_batch_notes.py                     # LLM notes for new batches
 ```
+
+catalog.sql stamps newly published filenames into the first-seen ledger
+(powers the landing page's "Fresh from the archive"); build_batch_notes.py
+writes the LLM editorial note the section displays. Order matters: publish,
+backfill, catalog, notes.
 
 `corpus.admin_areas` / `admin_area_towns` / `admin_area_adj` are published by
 `build_admin_areas.py`, not pg_publish, and survive the swap untouched — but
