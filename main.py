@@ -575,7 +575,7 @@ ENRICHMENT_USER_PROMPT = """Analyze the following document text and return a JSO
   "event_location": {{
     "country": "string or null",
     "region": "state/province/region or null",
-    "city": "string or null",
+    "city": "string or null (if the document covers MULTIPLE nearby towns, use the primary/first one — never null just because there are several)",
     "site": "specific site name (e.g. air base, lake) or null"
   }},
   "entities": {{
@@ -889,19 +889,30 @@ def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -
     native_docs = [d for d in docs if d.get("text_native")]
     ocr_docs    = deduplicate_texts(ocr_docs, threshold=0.85)
 
+    # ENRICH_NATIVE=1: push text-native docs through Claude enrichment too.
+    # The default skip exists for structured row groups (CSV/JSON), where
+    # enrichment buys nothing — but prose HTML (e.g. the Wikipedia biography/
+    # incident corpus) needs enrichment or its people/organizations arrays
+    # stay empty and the docs never reach corpus.entities / the entity graph.
+    enrich_native = enrich and os.environ.get("ENRICH_NATIVE") == "1"
+
     enriched_docs = []
     if ocr_docs:
         if enrich:
             enriched_docs += enrich_all(ocr_docs, models.llm)
         else:
             enriched_docs += ocr_docs
-    for d in native_docs:
-        enriched_docs.append({
-            **d,
-            **_default_enrichment(d["filename"]),
-            "document_type": "structured_dataset",
-            "ocr_quality": "good",  # text-native — no OCR involved
-        })
+    if native_docs and enrich_native:
+        for d in enrich_all(native_docs, models.llm):
+            enriched_docs.append({**d, "ocr_quality": "good"})
+    else:
+        for d in native_docs:
+            enriched_docs.append({
+                **d,
+                **_default_enrichment(d["filename"]),
+                "document_type": "structured_dataset",
+                "ocr_quality": "good",  # text-native — no OCR involved
+            })
 
     chunks = chunk_documents(enriched_docs)
     embed_and_store(chunks, models.embedder, models.collection)
@@ -1065,7 +1076,11 @@ def embed_and_store(chunks: list[dict], embedder, collection):
     metadatas = [{k: v for k, v in c.items() if k != "text"} for c in chunks]
 
     log.info(f"Embedding {len(texts)} chunks...")
-    embeddings = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=True)
+    # batch_size only affects peak VRAM, not the output vectors. bge-m3 with
+    # 8192-token sequences OOMs an 8GB card at the ST default of 32.
+    embed_batch = int(os.environ.get("EMBED_BATCH", "32"))
+    embeddings = embedder.encode(texts, normalize_embeddings=True,
+                                 batch_size=embed_batch, show_progress_bar=True)
 
     batch_size = 500
     for i in range(0, len(texts), batch_size):

@@ -95,6 +95,63 @@ python pipeline.py all \
 
 > Note: `--sources` is accepted by `ingest` but ignored — ingest processes the whole `--downloads-dir` tree. Restrict at download time instead.
 
+### Scoped AFU drains
+
+`--afu-dirs` restricts the AFU crawl to specific directories of files.afu.se —
+use a separate `--manifest-dir` so the scoped manifest never clobbers the main
+one (the ledger `data/downloads.json` is shared and append-only either way).
+
+The UFO Newsclipping Service drain (492 monthly issues, 1969–2011 — local-press
+UFO stories worldwide, the primary source for "reported only in the county
+paper" lore; first drained 2026-07-20):
+
+```bash
+python pipeline.py discover --scrape --sources afu_se \
+  --afu-dirs "Magazines/United States/UFO Newsclipping Service" \
+  --afu-max-files 600 --manifest-dir data/manifest_ncs
+python pipeline.py download --sources afu_se --manifest-dir data/manifest_ncs
+```
+
+Nearby shelves worth the same treatment later: `Magazines/United States/APCIC
+clipping service`, the `Clippings/` tree (US/UK/Sweden), and the state-MUFON
+newsletter runs under `Magazines/United States/MUFON *`.
+
+### Post-publish backfills — ALWAYS re-run after pg_publish
+
+`pg_publish.py` regenerates `corpus.chunks` from the build store, which
+discards any metadata applied directly to Postgres. After every publish
+(dev AND prod), in this order:
+
+```bash
+docker exec -i uap-api-postgres-1 psql -U uap -d uapdb < ../uap-api/db/search_upgrade.sql
+                                                # rebuilds corpus.entities +
+                                                # corpus.incidents from chunk meta
+python build_entity_aliases.py --apply          # entity alias resolution (name index)
+python backfill_nuforc_urls.py --apply          # idempotent, ~8 min
+docker exec -i uap-api-postgres-1 psql -U uap -d uapdb < ../uap-api/db/catalog.sql
+python build_batch_notes.py                     # LLM notes for new batches
+```
+
+search_upgrade.sql denormalizes the enrichment `people`/`organizations`/
+`named_incidents` arrays into `corpus.entities` and rebuilds the incident
+corroboration tables — without it (and the alias pass after it) newly
+published documents are invisible to /api/v1/entities and the graph views.
+catalog.sql stamps newly published filenames into the first-seen ledger
+(powers the landing page's "Fresh from the archive"); build_batch_notes.py
+writes the LLM editorial note the section displays.
+
+**Text-native HTML and enrichment:** by default `.txt/.csv/.json/.html`
+ingests skip Claude enrichment, so their entity arrays are empty and they
+never reach corpus.entities. For prose HTML corpora (e.g. the Wikipedia
+biography/incident batch, 2026-07) run ingest with `ENRICH_NATIVE=1` so the
+entity/graph/name indexes cover them. Leave it unset for structured row
+groups (CSV/JSON) — enrichment buys nothing there.
+
+`corpus.admin_areas` / `admin_area_towns` / `admin_area_adj` are published by
+`build_admin_areas.py`, not pg_publish, and survive the swap untouched — but
+if `corpus.locations` gains/loses rows, re-run `build_admin_areas.py --apply`
+so town membership stays aligned.
+
 ---
 
 ## 5. Sources covered

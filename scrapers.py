@@ -567,9 +567,31 @@ def scrape_majestic(session, opts) -> list[dict]:
 def scrape_afu(session, opts) -> list[dict]:
     max_files = opts.get("afu_max_files", 2000)
     max_depth = opts.get("afu_max_depth", 4)
+    # Scope the crawl: afu_dirs seeds BFS at those root-relative directories
+    # (and restricts descent to them); afu_exclude prunes subtree prefixes.
+    # Matching is case-insensitive on the "?dir=" path.
+    only = [d.strip().strip("/").lower()
+            for d in (opts.get("afu_dirs") or "").split(",") if d.strip()]
+    exclude = [d.strip().strip("/").lower()
+               for d in (opts.get("afu_exclude") or "").split(",") if d.strip()]
+
+    def in_scope(d):
+        dl = d.lower()
+        if any(dl.startswith(x) for x in exclude):
+            return False
+        if not only:
+            return True
+        # keep ancestors of the target dirs and everything under them
+        return any(dl.startswith(o) or o.startswith(dl) for o in only)
+
     root = "https://files.afu.se/Downloads/"
     out = []
-    to_visit = [(root, 0)]
+    if only:
+        to_visit = [(f"{root}?dir={quote(d)}", d.count("/") + 1)
+                    for d in (x.strip().strip("/")
+                              for x in opts["afu_dirs"].split(",")) if d]
+    else:
+        to_visit = [(root, 0)]
     visited = set()
     while to_visit and len(out) < max_files:
         url, depth = to_visit.pop(0)
@@ -590,7 +612,7 @@ def scrape_afu(session, opts) -> list[dict]:
                 # is the self-link). Depth = path depth of the dir param.
                 params = parse_qs(query)
                 d = (params.get("dir") or [""])[0].strip("/")
-                if d and d != "." and "order" not in params:
+                if d and d != "." and "order" not in params and in_scope(d):
                     d_depth = d.count("/") + 1
                     norm = f"{root}?dir={quote(d)}"
                     if d_depth <= max_depth and norm not in visited:
@@ -598,7 +620,8 @@ def scrape_afu(session, opts) -> list[dict]:
                 continue
             if href.endswith("/") and depth < max_depth:
                 to_visit.append((href, depth + 1))
-            elif href.lower().endswith((".pdf", ".zip", ".txt", ".djvu")):
+            elif href.lower().endswith((".pdf", ".zip", ".txt", ".djvu", ".doc",
+                                        ".docx", ".xlsx", ".csv", ".json")):
                 out.append(resource(
                     "afu_se", unquote(href[len(root):]), href,
                     _kind_from_url(href), COMMUNITY, verified=True,
@@ -666,8 +689,56 @@ def scrape_italy_ami(session, opts) -> list[dict]:
             continue
         seen.add(url)
         out.append(resource("italy_ami", f"Italy AMI OVNI: {_title_from_url(url)}",
-                            url, "pdf", INTL_GOV, verified=True))
+                            url, "pdf", INTL_GOV, verified=True, insecure=True))
     log.info(f"italy_ami: {len(out)} PDFs")
+    return out
+
+
+def scrape_norway_riksarkivet(session, opts) -> list[dict]:
+    """Riksarkivet declassified UFO folder via the Digitalarkivet viewer.
+
+    Folder 216590 ('Fremmede flygende objekter over norsk territorium',
+    Forsvarets overkommando 1954-1970, declassified 2024) serves one JPEG
+    per page at /image/<uuid>; the uuid is embedded in each
+    /view/216590/<n> page. Iterate until the viewer 404s (page 297 as of
+    2026-07). ~0.5s/page polite delay -> a few minutes of discovery.
+    """
+    out = []
+    max_pages = opts.get("digitalarkivet_max_pages", 400)
+    for n in range(1, max_pages + 1):
+        r = _get(session, f"https://media.digitalarkivet.no/view/216590/{n}")
+        if r is None:
+            break
+        m = re.search(r"/image/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})", r.text)
+        if not m:
+            log.warning(f"norway_riksarkivet: no image uuid on page {n}, stopping")
+            break
+        out.append(resource(
+            "norway_riksarkivet", f"Riksarkivet UFO folder 216590, page {n:03d}",
+            f"https://media.digitalarkivet.no/image/{m.group(1)}",
+            "image", INTL_GOV, verified=True,
+            save_as=f"riksarkivet_216590_page_{n:03d}.jpg"))
+    log.info(f"norway_riksarkivet: {len(out)} page images")
+    return out
+
+
+def scrape_hessdalen(session, opts) -> list[dict]:
+    """Project Hessdalen technical reports: PDF links on one static page
+    (some hosted on partner domains — keep those too)."""
+    base = "https://old.hessdalen.org/reports/"
+    r = _get(session, base)
+    if r is None:
+        return []
+    out, seen = [], set()
+    for m in re.finditer(r'href="([^"]+\.pdf)"', r.text, re.I):
+        url = urljoin(base, m.group(1))
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(resource("norway_hessdalen",
+                            f"Hessdalen report: {_title_from_url(url)}",
+                            url, "pdf", COMMUNITY, verified=True))
+    log.info(f"hessdalen: {len(out)} PDFs")
     return out
 
 
@@ -722,6 +793,8 @@ def scrape_cia_ia_mirror(session, opts) -> list[dict]:
 SCRAPERS = {
     "italy_ami":         scrape_italy_ami,
     "chile_sefaa":       scrape_chile_sefaa,
+    "norway_riksarkivet": scrape_norway_riksarkivet,
+    "hessdalen":         scrape_hessdalen,
     "cia_ia_mirror":     scrape_cia_ia_mirror,
     "wargov_pursue":     scrape_wargov,
     "nara_uap_bulk":     scrape_nara,
