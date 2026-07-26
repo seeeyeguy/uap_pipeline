@@ -119,19 +119,33 @@ newsletter runs under `Magazines/United States/MUFON *`.
 ### Post-publish backfills — ALWAYS re-run after pg_publish
 
 `pg_publish.py` regenerates `corpus.chunks` from the build store, which
-discards any metadata applied directly to Postgres. Currently that means the
-NUFORC per-report URLs. After every publish (dev AND prod):
+discards any metadata applied directly to Postgres. After every publish
+(dev AND prod), in this order:
 
 ```bash
+docker exec -i uap-api-postgres-1 psql -U uap -d uapdb < ../uap-api/db/search_upgrade.sql
+                                                # rebuilds corpus.entities +
+                                                # corpus.incidents from chunk meta
+python build_entity_aliases.py --apply          # entity alias resolution (name index)
 python backfill_nuforc_urls.py --apply          # idempotent, ~8 min
 docker exec -i uap-api-postgres-1 psql -U uap -d uapdb < ../uap-api/db/catalog.sql
 python build_batch_notes.py                     # LLM notes for new batches
 ```
 
+search_upgrade.sql denormalizes the enrichment `people`/`organizations`/
+`named_incidents` arrays into `corpus.entities` and rebuilds the incident
+corroboration tables — without it (and the alias pass after it) newly
+published documents are invisible to /api/v1/entities and the graph views.
 catalog.sql stamps newly published filenames into the first-seen ledger
 (powers the landing page's "Fresh from the archive"); build_batch_notes.py
-writes the LLM editorial note the section displays. Order matters: publish,
-backfill, catalog, notes.
+writes the LLM editorial note the section displays.
+
+**Text-native HTML and enrichment:** by default `.txt/.csv/.json/.html`
+ingests skip Claude enrichment, so their entity arrays are empty and they
+never reach corpus.entities. For prose HTML corpora (e.g. the Wikipedia
+biography/incident batch, 2026-07) run ingest with `ENRICH_NATIVE=1` so the
+entity/graph/name indexes cover them. Leave it unset for structured row
+groups (CSV/JSON) — enrichment buys nothing there.
 
 `corpus.admin_areas` / `admin_area_towns` / `admin_area_adj` are published by
 `build_admin_areas.py`, not pg_publish, and survive the swap untouched — but

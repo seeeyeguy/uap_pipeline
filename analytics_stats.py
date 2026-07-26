@@ -43,8 +43,8 @@ tot, geo, dated, city, clustered = con.execute("""SELECT COUNT(*),
     COUNT(*) FILTER (location_id IS NOT NULL),
     COUNT(*) FILTER (geo_cluster >= 0) FROM events""").fetchone()
 n_clusters = con.execute("SELECT COUNT(*) FROM geo_clusters").fetchone()[0]
-n_waves = con.execute(
-    "SELECT COUNT(DISTINCT wave_cluster) FROM events WHERE wave_cluster IS NOT NULL").fetchone()[0]
+n_waves = con.execute("SELECT COUNT(*) FROM st_clusters").fetchone()[0]
+n_flaps = con.execute("SELECT COUNT(*) FROM time_clusters").fetchone()[0]
 
 md.append("# UAP Corpus Analytics")
 md.append(f"\n_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} "
@@ -55,7 +55,8 @@ md.append(f"- **{geo:,} geocoded** ({geo/tot:.0%}) · **{dated:,} dated** "
           f"({dated/tot:.0%}) · **{city:,} resolved to a canonical GeoNames "
           f"city** ({city/tot:.0%})")
 md.append(f"- **{n_clusters:,} spatial hotspot clusters** covering "
-          f"{clustered:,} events · **{n_waves:,} decade-windowed wave clusters**")
+          f"{clustered:,} events · **{n_waves:,} spatiotemporal wave clusters** · "
+          f"**{n_flaps:,} temporal flap periods**")
 
 # ── per source ──
 persist("stats_sources", """
@@ -133,22 +134,21 @@ table("Top 20 spatial hotspots (all-time)", """
       lambda r: [str(r[0]), f"{r[1]:,}", r[2] or "", r[3] or "", r[4] or "",
                  str(r[5]), str(r[6]), str(r[7] or ""), str(r[8] or "")])
 
-# ── waves: dense decade-windowed concentrations ──
-persist("stats_waves", """
-    SELECT wave_cluster, COUNT(*) n,
-           MODE(NULLIF(loc_city,'')) top_city,
-           MODE(COALESCE(NULLIF(loc_region,''), NULLIF(region,''))) top_region,
-           MODE(COALESCE(NULLIF(loc_country,''), NULLIF(country,''))) top_country,
-           MIN(event_year) yr_min, MAX(event_year) yr_max
-    FROM events WHERE wave_cluster IS NOT NULL
-    GROUP BY wave_cluster ORDER BY n DESC""")
-table("Largest wave concentrations per decade", """
-    SELECT wave_cluster, n, top_city, top_region, top_country FROM (
-      SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY split_part(wave_cluster, ':', 1) ORDER BY n DESC) rk
-      FROM stats_waves) WHERE rk = 1 ORDER BY wave_cluster""",
-      ["wave", "events", "city", "region", "country"],
-      lambda r: [r[0], f"{r[1]:,}", r[2] or "", r[3] or "", r[4] or ""])
+# ── waves + flaps: summary tables built by analytics_cluster.py ──
+con.execute("DROP TABLE IF EXISTS stats_waves")  # superseded by st_clusters
+table("Largest spatiotemporal waves (dense in space AND time)", """
+    SELECT st_cluster, n, date_min, date_max, top_city, top_region, top_country
+    FROM st_clusters LIMIT 20""",
+      ["wave", "events", "from", "to", "city", "region", "country"],
+      lambda r: [str(r[0]), f"{r[1]:,}", r[2] or "", r[3] or "",
+                 r[4] or "", r[5] or "", r[6] or ""])
+table("Temporal flap periods (report-rate spikes vs rolling baseline)", """
+    SELECT time_cluster, n, date_min, date_max, intensity,
+           top_region, top_country
+    FROM time_clusters ORDER BY time_cluster""",
+      ["flap", "events", "from", "to", "x baseline", "region", "country"],
+      lambda r: [str(r[0]), f"{r[1]:,}", r[2] or "", r[3] or "",
+                 str(r[4] or ""), r[5] or "", r[6] or ""])
 
 # ── quality (UFOSINT quality_score is the only per-event quality signal) ──
 persist("stats_quality", """
@@ -163,4 +163,4 @@ md.append(f"\n## Quality\n\nUFOSINT quality_score present on {qrows[0]:,} "
 OUT.write_text("\n".join(md) + "\n", encoding="utf-8")
 con.close()
 print(f"wrote {OUT.name} + stats_* tables "
-      f"(sources, decades, shapes, shape_eras, countries, us_states, waves, quality)")
+      f"(sources, decades, shapes, shape_eras, countries, us_states, quality)")

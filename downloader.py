@@ -67,9 +67,15 @@ def sha256_file(path: Path) -> str:
 
 
 def _download_file(session: requests.Session, url: str, dest: Path,
-                   expected_sha256: str = None, retries: int = 4) -> dict:
+                   expected_sha256: str = None, retries: int = 4,
+                   verify: bool = True) -> dict:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
+    if not verify:
+        # hosts flagged insecure in the manifest ship broken TLS chains
+        # (italy_ami, mexico_fani) — fetch works, cert validation doesn't
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     for attempt in range(1, retries + 1):
         try:
@@ -81,7 +87,8 @@ def _download_file(session: requests.Session, url: str, dest: Path,
                 headers["Range"] = f"bytes={done}-"
                 mode = "ab"
 
-            with session.get(url, stream=True, timeout=120, headers=headers) as r:
+            with session.get(url, stream=True, timeout=120, headers=headers,
+                             verify=verify) as r:
                 if r.status_code == 416:      # range past EOF — file complete
                     pass
                 elif r.status_code in (200, 206):
@@ -221,7 +228,8 @@ def download_all(manifest: dict, only_sources: list[str] = None,
                 stats["ok"] += 1
                 continue
             result = _download_file(session, r["url"], dest,
-                                    expected_sha256=r.get("sha256"))
+                                    expected_sha256=r.get("sha256"),
+                                    verify=not r.get("insecure"))
             if result.get("ok"):
                 result["path"] = str(dest)
 

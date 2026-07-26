@@ -57,6 +57,9 @@ def cmd_discover(args) -> dict:
             "cia_max_pages":        args.cia_max_pages,
             "blackvault_max_pages": args.blackvault_max_pages,
             "afu_max_files":        args.afu_max_files,
+            "afu_max_depth":        args.afu_max_depth,
+            "afu_dirs":             args.afu_dirs,
+            "afu_exclude":          args.afu_exclude,
             "crawl_max_pages":      args.crawl_max_pages,
             "ia_max_items":         args.ia_max_items,
         },
@@ -85,6 +88,7 @@ def cmd_download(args, manifest: dict = None):
     return download_all(
         manifest,
         only_sources=_sources_list(args.sources),
+        include_kinds=set(args.kinds.split(",")) if getattr(args, "kinds", None) else None,
         include_videos=args.include_videos,
         max_size_gb=args.max_size_gb,
         force=args.force,
@@ -207,7 +211,16 @@ def cmd_publish(args):
     env_path.write_text(env_text, encoding="utf-8")
     log.info(f"{env_path} -> {release.name}")
 
-    # 6. recreate the retriever and wait for health
+    # 6. sync the serving Postgres FIRST (pgvector hybrid retrieval +
+    #    analytics tables, atomic staging swap). Must precede the retriever
+    #    health gate: with backend=pg the retriever reports the pg chunk
+    #    count, which only matches the new release after this sync.
+    if not args.no_pg:
+        log.info("Syncing Postgres serving store (pg_publish.py)…")
+        subprocess.run([sys.executable, str(Path(__file__).parent / "pg_publish.py")],
+                       check=True)
+
+    # 7. recreate the retriever and wait for health
     if args.no_restart:
         log.info("--no-restart: restart the retriever yourself to serve the new release.")
     else:
@@ -231,19 +244,12 @@ def cmd_publish(args):
                       "check `docker compose logs retriever` in the api repo.")
             sys.exit(1)
 
-    # 7. prune old releases (never the one just published/served)
+    # 8. prune old releases (never the one just published/served)
     old = sorted(d for d in releases_root.iterdir()
                  if d.is_dir() and d.name.startswith("v-") and d != release)
     for d in old[:max(0, len(old) - (args.keep - 1))]:
         log.info(f"Pruning old release: {d.name}")
         shutil.rmtree(d)
-
-    # 8. sync the serving Postgres (pgvector hybrid retrieval + analytics
-    #    tables). Atomic staging swap — the retriever needs no restart.
-    if not args.no_pg:
-        log.info("Syncing Postgres serving store (pg_publish.py)…")
-        subprocess.run([sys.executable, str(Path(__file__).parent / "pg_publish.py")],
-                       check=True)
 
 
 def cmd_inventory(args):
@@ -451,6 +457,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--cia-max-pages", type=int, default=150)
         sp.add_argument("--blackvault-max-pages", type=int, default=25)
         sp.add_argument("--afu-max-files", type=int, default=2000)
+        sp.add_argument("--afu-max-depth", type=int, default=4)
+        sp.add_argument("--afu-dirs", default="",
+                        help="comma-separated root-relative AFU directories to crawl "
+                             "(e.g. 'Topics,Databases'); empty = whole tree")
+        sp.add_argument("--afu-exclude", default="",
+                        help="comma-separated AFU directory prefixes to skip")
         sp.add_argument("--crawl-max-pages", type=int, default=300)
         sp.add_argument("--ia-max-items", type=int, default=500,
                         help="max items to enumerate per archive.org collection (1 HTTP call each)")
@@ -458,6 +470,9 @@ def build_parser() -> argparse.ArgumentParser:
     def download_opts(sp):
         sp.add_argument("--include-videos", action="store_true",
                         help="also download video resources (large!)")
+        sp.add_argument("--kinds", default=None,
+                        help="comma-separated kinds to download (e.g. 'html,json'); "
+                             "overrides the default excluded kinds")
         sp.add_argument("--max-size-gb", type=float, default=None,
                         help="skip individual resources with a size hint above this")
         sp.add_argument("--total-gb", type=float, default=None,
