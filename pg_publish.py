@@ -129,6 +129,11 @@ def sync_chunks(pg):
     cur.execute("CREATE INDEX chunks_new_tsv_simple_idx ON corpus.chunks_new USING gin (tsv_simple)")
     cur.execute("CREATE INDEX chunks_new_tsv_en_idx ON corpus.chunks_new USING gin (tsv_en)")
     cur.execute("CREATE INDEX chunks_new_meta_idx ON corpus.chunks_new USING gin (meta jsonb_path_ops)")
+    # Filename equality drives the entity/document/citation endpoints; the
+    # gin meta index cannot serve ->> equality, and dropping this on every
+    # swap silently regressed those lookups from ~20ms to 15s scans.
+    cur.execute("CREATE INDEX chunks_new_meta_filename_idx"
+                " ON corpus.chunks_new ((meta->>'filename'))")
     pg.commit()
     swap(cur, "chunks")
     pg.commit()
