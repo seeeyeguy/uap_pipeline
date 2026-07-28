@@ -290,6 +290,7 @@ def retrieve(question, n=5, filters=None, mode="hybrid"):
             "distance":      dist,
             "score":         score,
             "source":        meta.get("filename") or meta.get("source") or "",
+            "title":         meta.get("title", ""),
             "document_type": meta.get("document_type", ""),
             "summary":       meta.get("summary", ""),
         }
