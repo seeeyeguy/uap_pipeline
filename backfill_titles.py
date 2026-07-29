@@ -184,6 +184,10 @@ def resolve(docs: list[dict], cache: dict) -> dict[str, str]:
             t = clean_filename(f)
         else:
             t = cache.get(f) or template_title(d)
+            # a bare "Unknown"-class template beats nothing, but the cleaned
+            # filename beats both — thin docs keep their name, not a shrug
+            if t.lower().startswith("unknown") and len(WORD_RE.findall(clean_filename(f))) >= 1:
+                t = clean_filename(f)
         titles[f] = t
     # disambiguate duplicates with event date, else the archival id
     seen = {}
