@@ -198,10 +198,15 @@ def pass_b(pg):
             WHERE COALESCE(meta->>'loc_region','') <> ''
             GROUP BY 1
         )
+        , blanks AS (
+            -- hash-join against the distinct blank set instead of a
+            -- correlated EXISTS probe per filename: the probe form went
+            -- pathological (12h+, stalled parallel workers) past 500k rows.
+            SELECT DISTINCT meta->>'filename' AS f
+            FROM corpus.chunks WHERE {BLANK}
+        )
         SELECT k.f, k.city, k.region, k.country
-        FROM known k
-        WHERE EXISTS (SELECT 1 FROM corpus.chunks c
-                      WHERE c.meta->>'filename' = k.f AND {BLANK})""").fetchall()
+        FROM known k JOIN blanks USING (f)""").fetchall()
     return {f: (city or "", region or "", country or "") for f, city, region, country in rows}
 
 
@@ -320,6 +325,9 @@ def main():
     args = ap.parse_args()
 
     with psycopg.connect(dsn()) as pg:
+        # parallel gather stalls on the big jsonb aggregations; single-process
+        # plans are reliably faster here.
+        pg.execute("SET max_parallel_workers_per_gather = 0")
         gaz = Gazetteer(pg)
         updates = pass_a(pg, gaz)
         print(f"pass A (filenames): {len(updates)} docs")

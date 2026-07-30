@@ -13,6 +13,7 @@ import json
 import zipfile
 import logging
 import threading
+import gc
 import requests
 import torch
 
@@ -157,6 +158,17 @@ class Models:
         if self._ocr is None:
             self._ocr = load_ocr_model()
         return self._ocr
+
+    def unload_ocr(self):
+        """Free GLM-OCR's VRAM before the embedder loads. On an 8 GB card the
+        two don't fit together and the embed phase OOMs; the lazy property
+        transparently reloads OCR if a later group needs it again."""
+        if self._ocr is not None:
+            self._ocr = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            log.info("OCR model unloaded — VRAM freed for embedding.")
 
     @property
     def embedder(self):
@@ -365,7 +377,9 @@ def ocr_pdf(pdf_path: Path, processor, model) -> str:
     # OOM-killed the process on a 1126-page scan (>11 GB of pixels).
     img_paths = convert_from_path(
         str(pdf_path),
-        dpi=200,
+        # OCR_DPI: lower (e.g. 130) rescues dense-graphics scans whose pages
+        # allocate ~1 GB at 200 DPI and OOM the 8 GB card (the CARET set).
+        dpi=int(os.environ.get("OCR_DPI", "200")),
         output_folder=str(img_dir),
         fmt="jpeg",
         output_file="page_",
@@ -915,6 +929,10 @@ def process_doc_batch(docs: list[dict], models: "Models", enrich: bool = True) -
             })
 
     chunks = chunk_documents(enriched_docs)
+    # OCR is finished for this batch — free its VRAM before the embedder
+    # loads (the two never fit together on the 8 GB card). A later group
+    # that needs OCR again reloads it lazily.
+    models.unload_ocr()
     embed_and_store(chunks, models.embedder, models.collection)
     return len(chunks)
 
