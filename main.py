@@ -583,6 +583,7 @@ Always respond with valid JSON only. No preamble, no explanation, no markdown fe
 ENRICHMENT_USER_PROMPT = """Analyze the following document text and return a JSON object with this exact structure:
 
 {{
+  "title": "short display title (max 75 chars) a researcher would recognize in a list: lead with the collection or agency when known (FBI file, CIA memo, Project Blue Book case file...), then the central subject — a person, named incident, or place + date. Use only facts from the text; plain text, no trailing period",
   "summary": "2-4 sentence factual summary of what this document contains",
   "document_type": "one of: [sighting_report, government_memo, witness_testimony, research_report, news_article, investigation_report, correspondence, unknown]",
   "event_date": "ISO date string if determinable (YYYY-MM-DD), or date range (YYYY/YYYY), or null",
@@ -712,6 +713,7 @@ def _finalize_enrichment(doc: dict, enriched: dict) -> dict:
 def _default_enrichment(filename: str) -> dict:
     """Fallback enrichment if LLM call fails."""
     return {
+        "title": "",
         "summary": "",
         "document_type": "unknown",
         "event_date": None,
@@ -1049,6 +1051,7 @@ def chunk_documents(docs: list[dict]) -> list[dict]:
                 "pages":                pages,
                 # Enriched fields — all stringified for ChromaDB compatibility
                 "summary":              doc.get("summary", ""),
+                "title":                doc.get("title") or "",
                 "document_type":        doc.get("document_type", "unknown"),
                 "event_date":           doc.get("event_date") or "",
                 "country":              (doc.get("event_location") or {}).get("country") or "",
