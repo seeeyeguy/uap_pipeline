@@ -103,6 +103,43 @@ def flat_meta(stem, e, pages, source):
     }
 
 
+def doc_chunks(stem: str, splitter=None):
+    """Chunk one document exactly as the full rebuild does. Returns a list of
+    {id, text, metadata} dicts (empty when the doc is too short/absent).
+    Shared by main() and pg_patch.py so patch and rebuild can never drift."""
+    if splitter is None:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ".", " "])
+    tp = TEXT / f"{stem}.txt"
+    if not tp.exists():
+        return []
+    text = tp.read_text(encoding="utf-8", errors="ignore")
+    if len(text.strip()) < 50:
+        return []
+    ep = ENR / f"{stem}.json"
+    e = json.loads(ep.read_text()) if ep.exists() else {}
+    source = "corpus"  # single collection; source dir not tracked per-doc here
+    meta = flat_meta(stem, e, "", source)
+
+    if PAGE_MARKER.search(text):
+        splits = _page_aligned_splits(text, splitter)
+    else:
+        splits = [(s, "") for s in splitter.split_text(text)]
+    # drop degenerate chunks (OCR loops, alphabet-free table shred)
+    splits = [(b, p) for b, p in splits if not chunk_junk_reason(b)]
+    summary = (e.get("summary") or "").strip()
+    if summary:
+        splits = [(summary, "summary")] + splits
+
+    src_tag = hashlib.sha1(source.encode()).hexdigest()[:8]
+    out = []
+    for i, (body, pages) in enumerate(splits, start=(-1 if summary else 0)):
+        m = dict(meta); m["pages"] = pages; m["chunk_id"] = i
+        out.append({"id": f"{stem}_{src_tag}_chunk_{i}", "text": body, "metadata": m})
+    return out
+
+
 def main():
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
@@ -110,32 +147,12 @@ def main():
     n_docs = n_chunks = 0
     with open(OUT, "w") as fout:
         for tp in sorted(TEXT.glob("*.txt")):
-            stem = tp.stem
-            text = tp.read_text(encoding="utf-8", errors="ignore")
-            if len(text.strip()) < 50:
+            chunks = doc_chunks(tp.stem, splitter)
+            if not chunks:
                 continue
-            ep = ENR / f"{stem}.json"
-            e = json.loads(ep.read_text()) if ep.exists() else {}
-            source = "corpus"  # single collection; source dir not tracked per-doc here
-            meta = flat_meta(stem, e, "", source)
-
-            if PAGE_MARKER.search(text):
-                splits = _page_aligned_splits(text, splitter)
-            else:
-                splits = [(s, "") for s in splitter.split_text(text)]
-            # drop degenerate chunks (OCR loops, alphabet-free table shred)
-            splits = [(b, p) for b, p in splits if not chunk_junk_reason(b)]
-            summary = (e.get("summary") or "").strip()
-            if summary:
-                splits = [(summary, "summary")] + splits
-
-            src_tag = hashlib.sha1(source.encode()).hexdigest()[:8]
-            for i, (body, pages) in enumerate(splits, start=(-1 if summary else 0)):
-                cid = f"{stem}_{src_tag}_chunk_{i}"
-                m = dict(meta); m["pages"] = pages; m["chunk_id"] = i
-                fout.write(json.dumps({"id": cid, "text": body, "metadata": m},
-                                      ensure_ascii=False) + "\n")
-                n_chunks += 1
+            for c in chunks:
+                fout.write(json.dumps(c, ensure_ascii=False) + "\n")
+            n_chunks += len(chunks)
             n_docs += 1
             if n_docs % 2000 == 0:
                 print(f"{n_docs} docs, {n_chunks} chunks", flush=True)
