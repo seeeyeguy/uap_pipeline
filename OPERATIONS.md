@@ -260,3 +260,22 @@ python pipeline.py query "nuclear facility overflights" --type government_memo -
 
 Metadata filters map to ChromaDB `where` clauses: `document_type`, `time_period`, `official_source`, `radar_confirmation`.
 ```
+
+## Patch publish (small changes — minutes, not hours)
+
+For a SMALL set of changed docs (re-OCR, enrichment fixes, small merges),
+skip the full rebuild→embed→assemble→republish cycle:
+
+    .venv/bin/python pg_patch.py --changed --apply --chroma        # local
+    PG_DSN=postgresql://…@localhost:15439/db \
+      .venv/bin/python pg_patch.py --changed --apply               # prod (tunnel)
+
+Per stem it re-chunks (shared code with rebuild_chunks.py), embeds locally,
+and in one transaction: COPY-stages rows, swaps the doc's chunks, refreshes
+its catalog_docs row, entities rows, and source_tier. Titles are preserved
+from the serving store when enrichment predates the title backfill.
+Refuses >500 stems (that's a rebuild). Full publish still owns: incidents/
+events linkage for new docs, analytics tables, chroma HNSW hygiene
+(--chroma is additive; tombstones reclaimed at the next full rebuild).
+Never CALL corpus.backfill_source_tier() for patches — it full-scans per
+loop; pg_patch applies the same CASE scoped to the patched filenames.
